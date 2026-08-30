@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Ferropipe
+GenericName=Connection Manager
+Comment=SSH/SFTP, SMB, WinRM and RDP connection manager with dual-pane file transfer
+Exec=ferropipe
+Icon=ferropipe
+Terminal=false
+Categories=Network;RemoteAccess;FileTransfer;
+Keywords=ssh;sftp;smb;winrm;rdp;transfer;remote;terminal;files;
+StartupWMClass=Ferropipe
+StartupNotify=true

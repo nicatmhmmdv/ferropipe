@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+*.pdb
+# Rendered icon variants (regenerated from assets/ferropipe.svg)
+/assets/ferropipe-*.png
