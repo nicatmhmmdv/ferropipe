@@ -1,0 +1,194 @@
+//! Native RDP sessions rendered inside Ferropipe using the `ferropipe-rdp` crate
+//! (no external Remmina). Each session runs its protocol loop on a background
+//! thread and publishes framebuffer snapshots; the UI draws them in a floating
+//! window and forwards mouse/keyboard as fast-path input.
+//!
+//! The session advertises multitransport, so where the server and the transport
+//! stack support it the graphics ride UDP (via the sibling `rdpeudp` crate);
+//! otherwise it stays on the reliable TCP path.
+
+use eframe::egui;
+use ferropipe_rdp::input::{mouse_event, unicode_event, PTRFLAGS_BUTTON1, PTRFLAGS_BUTTON2, PTRFLAGS_DOWN, PTRFLAGS_MOVE};
+use ferropipe_rdp::session::{RdpSession, SessionParams};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+/// A batch of fast-path input event byte-blobs.
+type InputBatch = Vec<Vec<u8>>;
+
+#[derive(Default)]
+struct FrameState {
+    rgba: Vec<u8>,
+    width: usize,
+    height: usize,
+    generation: u64,
+    status: Option<String>,
+    finished: bool,
+}
+
+struct NativeSession {
+    title: String,
+    frame: Arc<Mutex<FrameState>>,
+    input_tx: Sender<InputBatch>,
+    texture: Option<egui::TextureHandle>,
+    last_generation: u64,
+    open: bool,
+}
+
+/// Manages all open native RDP sessions.
+#[derive(Default)]
+pub struct NativeRdpManager {
+    sessions: Vec<NativeSession>,
+}
+
+impl NativeRdpManager {
+    pub fn new() -> NativeRdpManager {
+        NativeRdpManager::default()
+    }
+
+    /// Open a new native RDP session for `params`, titled `title`.
+    pub fn open(&mut self, params: SessionParams, title: String) {
+        let frame = Arc::new(Mutex::new(FrameState {
+            status: Some(format!("Connecting to {}…", params.host)),
+            ..Default::default()
+        }));
+        let (input_tx, input_rx): (Sender<InputBatch>, Receiver<InputBatch>) = channel();
+
+        let frame_bg = frame.clone();
+        thread::spawn(move || run_session(params, frame_bg, input_rx));
+
+        self.sessions.push(NativeSession {
+            title,
+            frame,
+            input_tx,
+            texture: None,
+            last_generation: 0,
+            open: true,
+        });
+    }
+
+    /// Draw every open session window. Call once per frame from the app's UI.
+    pub fn show(&mut self, ctx: &egui::Context) {
+        for session in &mut self.sessions {
+            let mut open = session.open;
+            egui::Window::new(&session.title)
+                .open(&mut open)
+                .default_size([1024.0, 768.0])
+                .show(ctx, |ui| session.render(ui));
+            session.open = open;
+        }
+        self.sessions.retain(|s| s.open);
+        if !self.sessions.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+impl NativeSession {
+    fn render(&mut self, ui: &mut egui::Ui) {
+        // Refresh the texture from the newest framebuffer snapshot.
+        let (status, finished) = {
+            let f = self.frame.lock().unwrap();
+            if f.generation != self.last_generation && f.width > 0 {
+                let image = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
+                self.texture = Some(ui.ctx().load_texture("rdp-desktop", image, egui::TextureOptions::LINEAR));
+                self.last_generation = f.generation;
+            }
+            (f.status.clone(), f.finished)
+        };
+
+        if let Some(msg) = status {
+            ui.horizontal(|ui| {
+                if !finished {
+                    ui.spinner();
+                }
+                ui.label(msg);
+            });
+        }
+
+        let Some(tex) = &self.texture else { return };
+        let size = tex.size_vec2();
+        egui::ScrollArea::both().show(ui, |ui| {
+            let response = ui.add(
+                egui::Image::new(egui::load::SizedTexture::new(tex.id(), size))
+                    .sense(egui::Sense::click_and_drag()),
+            );
+            self.forward_input(ui, &response);
+        });
+    }
+
+    /// Translate egui pointer + keyboard into fast-path input events.
+    fn forward_input(&self, ui: &egui::Ui, response: &egui::Response) {
+        let mut events: InputBatch = Vec::new();
+
+        if let Some(pos) = response.hover_pos() {
+            let rel = pos - response.rect.min;
+            let (x, y) = (rel.x.max(0.0) as u16, rel.y.max(0.0) as u16);
+            let mut flags = PTRFLAGS_MOVE;
+            if response.dragged_by(egui::PointerButton::Primary) || response.is_pointer_button_down_on() {
+                flags |= PTRFLAGS_DOWN | PTRFLAGS_BUTTON1;
+            } else if response.dragged_by(egui::PointerButton::Secondary) {
+                flags |= PTRFLAGS_DOWN | PTRFLAGS_BUTTON2;
+            }
+            events.push(mouse_event(flags, x, y));
+        }
+
+        ui.ctx().input(|i| {
+            for ev in &i.events {
+                if let egui::Event::Text(text) = ev {
+                    for ch in text.chars() {
+                        events.push(unicode_event(ch as u16, true));
+                        events.push(unicode_event(ch as u16, false));
+                    }
+                }
+            }
+        });
+
+        if !events.is_empty() {
+            let _ = self.input_tx.send(events);
+        }
+    }
+}
+
+/// Background thread body: connect, then pump frames and forward input.
+fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: Receiver<InputBatch>) {
+    let mut session = match RdpSession::connect(&params) {
+        Ok(s) => {
+            let mut f = frame.lock().unwrap();
+            f.status = Some("Connected".to_string());
+            s
+        }
+        Err(e) => {
+            let mut f = frame.lock().unwrap();
+            f.status = Some(format!("Connect failed: {e}"));
+            f.finished = true;
+            return;
+        }
+    };
+
+    loop {
+        while let Ok(events) = input_rx.try_recv() {
+            let _ = session.send_input(&events);
+        }
+        match session.pump() {
+            Ok(changed) => {
+                if changed {
+                    let fb = session.framebuffer();
+                    let mut f = frame.lock().unwrap();
+                    f.rgba = fb.pixels().to_vec();
+                    f.width = fb.width();
+                    f.height = fb.height();
+                    f.generation += 1;
+                    f.status = None;
+                }
+            }
+            Err(e) => {
+                let mut f = frame.lock().unwrap();
+                f.status = Some(format!("Session ended: {e}"));
+                f.finished = true;
+                return;
+            }
+        }
+    }
+}

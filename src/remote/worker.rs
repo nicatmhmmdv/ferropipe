@@ -41,10 +41,10 @@ fn worker_main(rx: Receiver<Command>, tx: Sender<Event>, repaint: impl Fn()) {
                     ConnectionKind::Ssh => run_ssh(&rx, &emit, &conn, secret.as_deref()),
                     ConnectionKind::Smb => run_smb(&rx, &emit, &conn, secret.as_deref()),
                     ConnectionKind::WinRm => run_winrm(&rx, &emit, &conn, secret.as_deref()),
-                    ConnectionKind::Rdp => {
+                    ConnectionKind::Rdp | ConnectionKind::RdpNative => {
                         emit(Event::Error {
                             context: "connect".into(),
-                            message: "RDP connections are launched via Remmina".into(),
+                            message: "RDP connections are handled in-app, not by the worker".into(),
                         });
                         false
                     }

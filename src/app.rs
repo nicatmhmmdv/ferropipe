@@ -258,6 +258,9 @@ pub struct FerropipeApp {
     pending_edit: HashMap<u64, EditWatch>,
     edits: Vec<EditWatch>,
     edit_poll: f64,
+
+    // Native RDP (in-app, via ferropipe-rdp) sessions.
+    native_rdp: crate::native_rdp::NativeRdpManager,
 }
 
 impl FerropipeApp {
@@ -326,6 +329,7 @@ impl FerropipeApp {
             pending_edit: HashMap::new(),
             edits: Vec::new(),
             edit_poll: 0.0,
+            native_rdp: crate::native_rdp::NativeRdpManager::new(),
         }
     }
 
@@ -460,6 +464,20 @@ impl FerropipeApp {
             }
             return;
         }
+        // Native RDP: open an in-app session via ferropipe-rdp (no external tool).
+        if conn.kind == ConnectionKind::RdpNative {
+            self.selected_conn = Some(id);
+            let password = match &conn.auth {
+                AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let mut params = ferropipe_rdp::session::SessionParams::new(&conn.host, &conn.username, &password);
+            params.port = conn.port;
+            params.domain = conn.domain.clone();
+            self.native_rdp.open(params, format!("RDP — {}", conn.name));
+            self.toast(ctx, format!("Opening native RDP → {}", conn.name), false);
+            return;
+        }
         if self.connecting {
             self.toast(ctx, "Already connecting — please wait…", true);
             return;
@@ -512,7 +530,7 @@ impl FerropipeApp {
         let Some(conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
             return;
         };
-        if conn.kind == ConnectionKind::Rdp {
+        if matches!(conn.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative) {
             self.toast(ctx, "RDP can't be used as a file pane — use SSH/SMB/WinRM", true);
             return;
         }
@@ -1017,6 +1035,9 @@ impl eframe::App for FerropipeApp {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
 
+        // Draw any open native RDP session windows.
+        self.native_rdp.show(&ctx);
+
         // Top bar
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(2.0);
@@ -1380,6 +1401,7 @@ impl FerropipeApp {
                             .selected_text(match ed.kind {
                                 ConnectionKind::Ssh => "SSH / SFTP",
                                 ConnectionKind::Rdp => "RDP (Remmina)",
+                                ConnectionKind::RdpNative => "RDP (Native)",
                                 ConnectionKind::Smb => "SMB (Windows share)",
                                 ConnectionKind::WinRm => "WinRM (Windows)",
                             })
@@ -1388,6 +1410,7 @@ impl FerropipeApp {
                                 ui.selectable_value(&mut ed.kind, ConnectionKind::Smb, "SMB (Windows share)");
                                 ui.selectable_value(&mut ed.kind, ConnectionKind::WinRm, "WinRM (Windows)");
                                 ui.selectable_value(&mut ed.kind, ConnectionKind::Rdp, "RDP (Remmina)");
+                                ui.selectable_value(&mut ed.kind, ConnectionKind::RdpNative, "RDP (Native)");
                             });
                         // When the type changes, retarget the port if it was still the old default.
                         if ed.kind != prev_kind {

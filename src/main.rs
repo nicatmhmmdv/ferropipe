@@ -5,6 +5,7 @@ mod app;
 mod external;
 mod localfs;
 mod model;
+mod native_rdp;
 mod rdp;
 mod remote;
 mod sshconfig;

@@ -34,6 +34,8 @@ pub enum ConnectionKind {
     Ssh,
     /// Remote Desktop — launched via an external Remmina client.
     Rdp,
+    /// Remote Desktop — native in-app client (ferropipe-rdp), no external tool.
+    RdpNative,
     /// Windows/Samba file share (SMB/CIFS) — native file browsing, no SSH needed.
     Smb,
     /// Windows Remote Management — command exec + file transfer over WinRM.
@@ -45,6 +47,7 @@ impl ConnectionKind {
         match self {
             ConnectionKind::Ssh => "SSH/SFTP",
             ConnectionKind::Rdp => "RDP",
+            ConnectionKind::RdpNative => "RDP (Native)",
             ConnectionKind::Smb => "SMB",
             ConnectionKind::WinRm => "WinRM",
         }
@@ -52,7 +55,7 @@ impl ConnectionKind {
     pub fn default_port(&self) -> u16 {
         match self {
             ConnectionKind::Ssh => 22,
-            ConnectionKind::Rdp => 3389,
+            ConnectionKind::Rdp | ConnectionKind::RdpNative => 3389,
             ConnectionKind::Smb => 445,
             ConnectionKind::WinRm => 5985,
         }
