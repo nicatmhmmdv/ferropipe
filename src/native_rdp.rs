@@ -207,8 +207,17 @@ fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: R
     }
 
     loop {
-        while let Ok(events) = input_rx.try_recv() {
-            let _ = session.send_input(&events);
+        // Drain pending input. If the UI side has gone (its window closed and
+        // the session was dropped), the sender is disconnected — tear down the
+        // RDP connection instead of looping forever holding the socket.
+        loop {
+            match input_rx.try_recv() {
+                Ok(events) => {
+                    let _ = session.send_input(&events);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            }
         }
         match session.pump() {
             Ok(changed) => {
