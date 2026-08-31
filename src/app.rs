@@ -9,8 +9,9 @@ use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
-use std::sync::mpsc;
 use uuid::Uuid;
 
 const ACCENT: Color32 = Color32::from_rgb(0xE0, 0x6C, 0x3A); // rust-orange
@@ -261,6 +262,46 @@ pub struct FerropipeApp {
 
     // Native RDP (in-app, via ferropipe-rdp) sessions.
     native_rdp: crate::native_rdp::NativeRdpManager,
+
+    // SSH-transfer panel for a Windows host (enable SSH → SFTP → disable SSH).
+    ssh_panel: Option<SshPanel>,
+}
+
+/// State for the "SSH file transfer" panel driving a Windows host: toggle the
+/// OpenSSH server via WinRM, then transfer files over SFTP. Long operations run
+/// on a background thread and report through the shared `status`/`busy` handles.
+struct SshPanel {
+    conn: Connection,
+    password: String,
+    remote_dir: String,
+    files: Vec<PathBuf>,
+    status: Arc<Mutex<String>>,
+    busy: Arc<AtomicBool>,
+}
+
+impl SshPanel {
+    fn set_status(&self, msg: impl Into<String>) {
+        *self.status.lock().unwrap() = msg.into();
+    }
+
+    /// Run `op` on a background thread with a busy guard, reporting `working`
+    /// first and the op's own result string on completion. Ignored if busy.
+    fn run_bg<F>(&self, working: &str, op: F)
+    where
+        F: FnOnce() -> String + Send + 'static,
+    {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return; // already running something
+        }
+        self.set_status(working);
+        let status = self.status.clone();
+        let busy = self.busy.clone();
+        std::thread::spawn(move || {
+            let msg = op();
+            *status.lock().unwrap() = msg;
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
 }
 
 impl FerropipeApp {
@@ -330,6 +371,7 @@ impl FerropipeApp {
             edits: Vec::new(),
             edit_poll: 0.0,
             native_rdp: crate::native_rdp::NativeRdpManager::new(),
+            ssh_panel: None,
         }
     }
 
@@ -567,6 +609,163 @@ impl FerropipeApp {
         params.domain = conn.domain.clone();
         self.native_rdp.open(params, format!("RDP — {}", conn.name), key);
         self.toast(ctx, format!("Opening native RDP → {}", conn.name), false);
+    }
+
+    /// Open the remote-access panel for a Windows host: toggle SSH/WinRM and
+    /// transfer files over SFTP, all with the connection's saved credentials.
+    fn open_ssh_panel(&mut self, id: Uuid) {
+        let Some(mut conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        conn.host = conn.effective_host();
+        let password = match &conn.auth {
+            AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.ssh_panel = Some(SshPanel {
+            conn,
+            password,
+            remote_dir: "Desktop".to_string(),
+            files: Vec::new(),
+            status: Arc::new(Mutex::new(String::new())),
+            busy: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
+    /// Draw the remote-access panel (SSH/WinRM toggles + SFTP transfer).
+    fn render_ssh_panel(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        if let Some(panel) = &mut self.ssh_panel {
+            let busy = panel.busy.load(Ordering::SeqCst);
+            let status = panel.status.lock().unwrap().clone();
+            let mut open = true;
+            egui::Window::new(format!("Remote access — {}", panel.conn.name))
+                .collapsible(false)
+                .resizable(true)
+                .default_width(460.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Toggle the host's SSH / WinRM services and transfer files, using this \
+                             connection's Windows credentials over whichever channel is reachable.",
+                        )
+                        .weak(),
+                    );
+                    ui.add_space(4.0);
+
+                    egui::Grid::new("remote_access_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("OpenSSH server");
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!busy, egui::Button::new("Enable SSH")).clicked() {
+                                    let (c, p) = (panel.conn.clone(), panel.password.clone());
+                                    panel.run_bg("Enabling SSH on host…", move || {
+                                        match crate::winssh::set_ssh_enabled(&c, &p, true) {
+                                            Ok(_) => "✓ SSH enabled on the host — you can transfer now.".into(),
+                                            Err(e) => format!("✗ {e:#}"),
+                                        }
+                                    });
+                                }
+                                if ui.add_enabled(!busy, egui::Button::new("Disable SSH")).clicked() {
+                                    let (c, p) = (panel.conn.clone(), panel.password.clone());
+                                    panel.run_bg("Disabling SSH on host…", move || {
+                                        match crate::winssh::set_ssh_enabled(&c, &p, false) {
+                                            Ok(_) => "✓ SSH disabled on the host.".into(),
+                                            Err(e) => format!("✗ {e:#}"),
+                                        }
+                                    });
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label("WinRM");
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!busy, egui::Button::new("Enable WinRM")).clicked() {
+                                    let (c, p) = (panel.conn.clone(), panel.password.clone());
+                                    panel.run_bg("Enabling WinRM on host…", move || {
+                                        match crate::winssh::set_winrm_enabled(&c, &p, true) {
+                                            Ok(_) => "✓ WinRM enabled on the host.".into(),
+                                            Err(e) => format!("✗ {e:#}"),
+                                        }
+                                    });
+                                }
+                                if ui.add_enabled(!busy, egui::Button::new("Disable WinRM")).clicked() {
+                                    let (c, p) = (panel.conn.clone(), panel.password.clone());
+                                    panel.run_bg("Disabling WinRM on host…", move || {
+                                        match crate::winssh::set_winrm_enabled(&c, &p, false) {
+                                            Ok(_) => "✓ WinRM disabled on the host.".into(),
+                                            Err(e) => format!("✗ {e:#}"),
+                                        }
+                                    });
+                                }
+                            });
+                            ui.end_row();
+                        });
+
+                    ui.separator();
+                    ui.label(RichText::new("Transfer files (needs SSH enabled)").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Remote folder:");
+                        ui.add(egui::TextEdit::singleline(&mut panel.remote_dir).desired_width(160.0))
+                            .on_hover_text("Relative to the user's home (e.g. Desktop) or an absolute path like C:/temp");
+                        if ui.button("Add files…").clicked() {
+                            if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                                panel.files.extend(paths);
+                            }
+                        }
+                        if !panel.files.is_empty() && ui.button("Clear").clicked() {
+                            panel.files.clear();
+                        }
+                    });
+                    if panel.files.is_empty() {
+                        ui.label(RichText::new("No files selected.").weak());
+                    } else {
+                        for f in &panel.files {
+                            ui.label(format!("• {}", f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+                        }
+                        let can_send = !busy && !panel.files.is_empty();
+                        if ui.add_enabled(can_send, egui::Button::new(format!("Transfer {} file(s)", panel.files.len()))).clicked() {
+                            let (host, user, pw) = (panel.conn.host.clone(), panel.conn.username.clone(), panel.password.clone());
+                            let (dir, files) = (panel.remote_dir.clone(), panel.files.clone());
+                            panel.run_bg("Transferring over SFTP…", move || {
+                                match crate::winssh::transfer(&host, &user, &pw, &dir, &files) {
+                                    Ok(r) if r.failures.is_empty() => format!("✓ Transferred {} file(s) to {dir}.", r.ok),
+                                    Ok(r) => format!(
+                                        "Transferred {} ok, {} failed: {}",
+                                        r.ok,
+                                        r.failures.len(),
+                                        r.failures.iter().map(|(n, e)| format!("{n} ({e})")).collect::<Vec<_>>().join("; ")
+                                    ),
+                                    Err(e) => format!("✗ Transfer failed: {e:#}"),
+                                }
+                            });
+                        }
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if busy {
+                            ui.spinner();
+                        }
+                        if !status.is_empty() {
+                            ui.label(status);
+                        }
+                    });
+                });
+            if busy {
+                ctx.request_repaint();
+            }
+            if !open {
+                close = true;
+            }
+        }
+        if close {
+            self.ssh_panel = None;
+        }
     }
 
     fn disconnect(&mut self) {
@@ -1302,6 +1501,7 @@ impl eframe::App for FerropipeApp {
         });
 
         self.render_dialogs(&ctx);
+        self.render_ssh_panel(&ctx);
         self.render_toasts(&ctx);
 
         // Keep animating while transfers run.
@@ -1432,6 +1632,11 @@ impl FerropipeApp {
                 if ui.button("Open in native RDP (experimental)").clicked() {
                     self.selected_conn = Some(c.id);
                     self.open_native_rdp(ctx, &c);
+                    ui.close();
+                }
+                if ui.button("Remote access (SSH/WinRM)…").clicked() {
+                    self.selected_conn = Some(c.id);
+                    self.open_ssh_panel(c.id);
                     ui.close();
                 }
             }

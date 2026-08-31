@@ -74,6 +74,12 @@ impl WinRmFs {
             .map_err(|e| anyhow!("{e}"))
     }
 
+    /// Public: run a PowerShell script over WinRM and return stdout (errors on
+    /// non-zero exit). Used by the SSH enable/disable helpers.
+    pub fn run_powershell(&self, script: &str) -> Result<String> {
+        self.ps_ok(script)
+    }
+
     /// Run PowerShell, return stdout, erroring on non-zero exit.
     fn ps_ok(&self, script: &str) -> Result<String> {
         let o = self.ps(script)?;

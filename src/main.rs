@@ -11,6 +11,7 @@ mod remote;
 mod sshconfig;
 mod store;
 mod vault;
+mod winssh;
 
 use anyhow::Context;
 
