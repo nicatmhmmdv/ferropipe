@@ -29,6 +29,8 @@ struct FrameState {
 
 struct NativeSession {
     title: String,
+    /// Stable, unique key for this session's OS window (viewport).
+    vp: u64,
     frame: Arc<Mutex<FrameState>>,
     input_tx: Sender<InputBatch>,
     texture: Option<egui::TextureHandle>,
@@ -40,6 +42,8 @@ struct NativeSession {
 #[derive(Default)]
 pub struct NativeRdpManager {
     sessions: Vec<NativeSession>,
+    /// Monotonic counter handing each session a stable viewport key.
+    next_vp: u64,
 }
 
 impl NativeRdpManager {
@@ -47,7 +51,8 @@ impl NativeRdpManager {
         NativeRdpManager::default()
     }
 
-    /// Open a new native RDP session for `params`, titled `title`.
+    /// Open a new native RDP session for `params`, titled `title`. Each session
+    /// gets its own maximized OS window.
     pub fn open(&mut self, params: SessionParams, title: String) {
         let frame = Arc::new(Mutex::new(FrameState {
             status: Some(format!("Connecting to {}…", params.host)),
@@ -58,8 +63,11 @@ impl NativeRdpManager {
         let frame_bg = frame.clone();
         thread::spawn(move || run_session(params, frame_bg, input_rx));
 
+        let vp = self.next_vp;
+        self.next_vp += 1;
         self.sessions.push(NativeSession {
             title,
+            vp,
             frame,
             input_tx,
             texture: None,
@@ -68,15 +76,26 @@ impl NativeRdpManager {
         });
     }
 
-    /// Draw every open session window. Call once per frame from the app's UI.
+    /// Draw every open session. Each rides its own maximized OS window (an egui
+    /// immediate viewport), like a real RDP client. Call once per frame.
     pub fn show(&mut self, ctx: &egui::Context) {
         for session in &mut self.sessions {
-            let mut open = session.open;
-            egui::Window::new(&session.title)
-                .open(&mut open)
-                .default_size([1024.0, 768.0])
-                .show(ctx, |ui| session.render(ui));
-            session.open = open;
+            if !session.open {
+                continue;
+            }
+            let vid = egui::ViewportId::from_hash_of(("ferropipe-rdp-session", session.vp));
+            let builder = egui::ViewportBuilder::default()
+                .with_title(session.title.clone())
+                .with_inner_size([1280.0, 800.0])
+                .with_maximized(true);
+            let mut keep_open = true;
+            ctx.show_viewport_immediate(vid, builder, |ui, _class| {
+                session.render(ui);
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    keep_open = false;
+                }
+            });
+            session.open = keep_open;
         }
         self.sessions.retain(|s| s.open);
         if !self.sessions.is_empty() {

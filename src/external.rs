@@ -53,16 +53,33 @@ fn terminal_invocation(cmd: &[String]) -> Option<(String, Vec<String>)> {
     None
 }
 
-/// Open a terminal running `ssh [-p port] user@host`.
-pub fn open_terminal_ssh(user_host: &str, port: u16) -> Result<()> {
+/// Open Alacritty (preferred) running `ssh [-i key] [-p port] user@host`, giving
+/// each connection its own terminal session. Falls back to the generic terminal
+/// chooser if Alacritty isn't installed.
+pub fn open_alacritty_ssh(user_host: &str, port: u16, identity: Option<&str>) -> Result<()> {
     let mut ssh = vec!["ssh".to_string()];
+    if let Some(key) = identity {
+        if !key.is_empty() {
+            ssh.push("-i".into());
+            ssh.push(key.to_string());
+        }
+    }
     if port != 22 {
         ssh.push("-p".into());
         ssh.push(port.to_string());
     }
     ssh.push(user_host.to_string());
+
+    // Prefer Alacritty explicitly — it's the terminal the workflow is built around.
+    if which("alacritty").is_some() {
+        let mut args = vec!["-e".to_string()];
+        args.extend(ssh.iter().cloned());
+        Command::new("alacritty").args(args).spawn()?;
+        return Ok(());
+    }
+    // Otherwise fall back to whatever terminal emulator is available.
     let (prog, args) = terminal_invocation(&ssh)
-        .ok_or_else(|| anyhow!("no terminal emulator found — set $TERMINAL"))?;
+        .ok_or_else(|| anyhow!("Alacritty not found and no fallback terminal — install alacritty or set $TERMINAL"))?;
     Command::new(prog).args(args).spawn()?;
     Ok(())
 }

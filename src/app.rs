@@ -508,6 +508,44 @@ impl FerropipeApp {
         });
     }
 
+    /// The primary "activate" gesture for a saved connection: open a fresh
+    /// session in its own window. SSH opens an Alacritty terminal; Windows/RDP
+    /// opens a maximized native RDP window; SMB/WinRM open the in-app file pane.
+    fn open_session(&mut self, ctx: &egui::Context, id: Uuid) {
+        let Some(conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        self.selected_conn = Some(id);
+        match conn.kind {
+            ConnectionKind::Ssh => {
+                let target = format!("{}@{}", conn.username, conn.host);
+                let identity = match &conn.auth {
+                    AuthMethod::Key { private_key, .. } if !private_key.is_empty() => Some(private_key.clone()),
+                    _ => None,
+                };
+                match crate::external::open_alacritty_ssh(&target, conn.port, identity.as_deref()) {
+                    Ok(()) => self.toast(ctx, format!("Terminal → {}", conn.name), false),
+                    Err(e) => self.toast(ctx, format!("terminal: {e:#}"), true),
+                }
+            }
+            ConnectionKind::Rdp | ConnectionKind::RdpNative => {
+                let password = match &conn.auth {
+                    AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let mut params = ferropipe_rdp::session::SessionParams::new(&conn.host, &conn.username, &password);
+                params.port = conn.port;
+                params.domain = conn.domain.clone();
+                self.native_rdp.open(params, format!("RDP — {}", conn.name));
+                self.toast(ctx, format!("Opening RDP → {}", conn.name), false);
+            }
+            ConnectionKind::Smb | ConnectionKind::WinRm => {
+                // File-oriented kinds open the in-app dual-pane browser.
+                self.connect(ctx, id);
+            }
+        }
+    }
+
     fn disconnect(&mut self) {
         self.worker.send(Command::Disconnect);
         self.connected = None;
@@ -1336,20 +1374,41 @@ impl FerropipeApp {
         if resp.clicked() {
             self.selected_conn = Some(c.id);
         }
+        // Double-click activates: opens a new session (terminal for SSH, a
+        // maximized RDP window for Windows, the file pane for SMB/WinRM).
         if resp.double_clicked() {
             self.selected_conn = Some(c.id);
-            self.connect(ctx, c.id);
+            self.open_session(ctx, c.id);
         }
         resp.context_menu(|ui| {
-            if ui.button("Connect").clicked() {
+            if ui.button("Open session").clicked() {
+                self.selected_conn = Some(c.id);
+                self.open_session(ctx, c.id);
+                ui.close();
+            }
+            // File-capable kinds can also open the in-app dual-pane browser.
+            if c.kind.browses_files() && ui.button("Browse files").clicked() {
                 self.selected_conn = Some(c.id);
                 self.connect(ctx, c.id);
                 ui.close();
             }
-            if c.kind == ConnectionKind::Ssh && ui.button("Open terminal").clicked() {
-                let target = format!("{}@{}", c.username, c.host);
-                if let Err(e) = crate::external::open_terminal_ssh(&target, c.port) {
-                    self.toast(ctx, format!("terminal: {e:#}"), true);
+            // Windows connections can fall back to the external Remmina client.
+            if matches!(c.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative)
+                && ui.button("Open in Remmina").clicked()
+            {
+                self.selected_conn = Some(c.id);
+                let password = match &c.auth {
+                    AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let config_dir = self
+                    .store_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                match crate::rdp::launch(c, &password, &config_dir) {
+                    Ok(_) => self.toast(ctx, format!("Launched Remmina → {}", c.name), false),
+                    Err(e) => self.toast(ctx, format!("RDP: {e:#}"), true),
                 }
                 ui.close();
             }
