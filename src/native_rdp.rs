@@ -225,6 +225,14 @@ fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: R
         frame.lock().unwrap().status = Some(msg);
     }
 
+    // Watchdog: if the session connects but never paints (the host sends EGFX /
+    // RemoteFX / H.264 graphics the native decoder can't handle yet), the window
+    // would just sit black. Surface a clear explanation after a grace period.
+    let connected_at = std::time::Instant::now();
+    let mut rendered_any = false;
+    let mut warned = false;
+    const NO_GRAPHICS_WARN: std::time::Duration = std::time::Duration::from_secs(7);
+
     loop {
         // Drain pending input. If the UI side has gone (its window closed and
         // the session was dropped), the sender is disconnected — tear down the
@@ -241,6 +249,7 @@ fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: R
         match session.pump() {
             Ok(changed) => {
                 if changed {
+                    rendered_any = true;
                     let fb = session.framebuffer();
                     let mut f = frame.lock().unwrap();
                     f.rgba = fb.pixels().to_vec();
@@ -248,6 +257,14 @@ fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: R
                     f.height = fb.height();
                     f.generation += 1;
                     f.status = None;
+                } else if !rendered_any && !warned && connected_at.elapsed() > NO_GRAPHICS_WARN {
+                    warned = true;
+                    frame.lock().unwrap().status = Some(
+                        "Connected, but no desktop image — this host sends RemoteFX/H.264 (EGFX) \
+                         graphics the native client can't decode yet. Use Remmina for this host \
+                         (double-click the connection)."
+                            .to_string(),
+                    );
                 }
             }
             Err(e) => {
