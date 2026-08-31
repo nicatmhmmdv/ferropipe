@@ -123,6 +123,27 @@ fn profile_text(conn: &Connection, password: &str) -> String {
     )
 }
 
+/// Remove generated profiles older than an hour. Remmina reads a profile into
+/// memory within moments of launch, so an old file is never needed again — this
+/// keeps the directory (and stale credential blobs) from accumulating without
+/// racing a launch still in progress.
+fn prune_old_profiles(dir: &Path) {
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("ferropipe-") && name.ends_with(".remmina")) {
+            continue;
+        }
+        if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+            if modified < cutoff {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// Write the profile (0600) and launch Remmina against it. Returns the profile path.
 pub fn launch(conn: &Connection, password: &str, config_dir: &std::path::Path) -> Result<PathBuf> {
     let remmina = which("remmina").ok_or_else(|| {
@@ -130,7 +151,15 @@ pub fn launch(conn: &Connection, password: &str, config_dir: &std::path::Path) -
     })?;
     let dir = profiles_dir(config_dir);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let file = dir.join(format!("ferropipe-{}.remmina", conn.id));
+    prune_old_profiles(&dir);
+    // A unique filename per launch: Remmina dedups by profile path, so a stable
+    // name would just refocus the already-open session. A fresh path makes each
+    // double-click start a NEW Remmina session/tab.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let file = dir.join(format!("ferropipe-{}-{}.remmina", conn.id, stamp));
     std::fs::write(&file, profile_text(conn, password)).context("write remmina profile")?;
     #[cfg(unix)]
     {
