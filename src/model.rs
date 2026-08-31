@@ -112,6 +112,18 @@ impl Connection {
         }
     }
 
+    /// The address to actually connect to. Falls back to the display name when
+    /// the Host field is blank — users routinely name a connection by its host or
+    /// IP and leave Host empty. Returns "" only when both are blank.
+    pub fn effective_host(&self) -> String {
+        let host = self.host.trim();
+        if host.is_empty() {
+            self.name.trim().to_string()
+        } else {
+            host.to_string()
+        }
+    }
+
     /// "user@host:port" label for display.
     pub fn target(&self) -> String {
         if self.port == 22 {

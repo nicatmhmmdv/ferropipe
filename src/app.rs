@@ -445,11 +445,17 @@ impl FerropipeApp {
     /// Connect the in-app file browser to `id`. Only SSH/SMB/WinRM browse files;
     /// RDP kinds open a session window instead, so they delegate to open_session.
     fn connect(&mut self, ctx: &egui::Context, id: Uuid) {
-        let Some(conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
+        let Some(mut conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
             return;
         };
         if matches!(conn.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative) {
             self.open_session(ctx, id);
+            return;
+        }
+        // Resolve the effective host (falls back to the name); bail clearly if blank.
+        conn.host = conn.effective_host();
+        if conn.host.is_empty() {
+            self.toast(ctx, format!("{}: no host set — edit the connection", conn.name), true);
             return;
         }
         if self.connecting {
@@ -486,10 +492,16 @@ impl FerropipeApp {
     /// session in its own window. SSH opens an Alacritty terminal; Windows/RDP
     /// opens a maximized native RDP window; SMB/WinRM open the in-app file pane.
     fn open_session(&mut self, ctx: &egui::Context, id: Uuid) {
-        let Some(conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
+        let Some(mut conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
             return;
         };
         self.selected_conn = Some(id);
+        // Resolve the effective host (falls back to the name); bail clearly if blank.
+        conn.host = conn.effective_host();
+        if conn.host.is_empty() {
+            self.toast(ctx, format!("{}: no host set — edit the connection", conn.name), true);
+            return;
+        }
         match conn.kind {
             ConnectionKind::Ssh => {
                 let target = format!("{}@{}", conn.username, conn.host);
@@ -550,11 +562,16 @@ impl FerropipeApp {
     }
 
     fn connect_left(&mut self, ctx: &egui::Context, id: Uuid) {
-        let Some(conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
+        let Some(mut conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
             return;
         };
         if matches!(conn.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative) {
             self.toast(ctx, "RDP can't be used as a file pane — use SSH/SMB/WinRM", true);
+            return;
+        }
+        conn.host = conn.effective_host();
+        if conn.host.is_empty() {
+            self.toast(ctx, format!("{}: no host set — edit the connection", conn.name), true);
             return;
         }
         if self.lconnecting {
@@ -1391,7 +1408,9 @@ impl FerropipeApp {
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| PathBuf::from("."));
-                match crate::rdp::launch(c, &password, &config_dir) {
+                let mut c = c.clone();
+                c.host = c.effective_host();
+                match crate::rdp::launch(&c, &password, &config_dir) {
                     Ok(_) => self.toast(ctx, format!("Launched Remmina → {}", c.name), false),
                     Err(e) => self.toast(ctx, format!("RDP: {e:#}"), true),
                 }
