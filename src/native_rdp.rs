@@ -29,6 +29,9 @@ struct FrameState {
 
 struct NativeSession {
     title: String,
+    /// Identity of the saved connection (dedup key), so re-activating a
+    /// connection that's already open doesn't spawn a second window.
+    key: String,
     /// Stable, unique key for this session's OS window (viewport).
     vp: u64,
     frame: Arc<Mutex<FrameState>>,
@@ -51,9 +54,15 @@ impl NativeRdpManager {
         NativeRdpManager::default()
     }
 
-    /// Open a new native RDP session for `params`, titled `title`. Each session
-    /// gets its own maximized OS window.
-    pub fn open(&mut self, params: SessionParams, title: String) {
+    /// Whether a session for the connection identified by `key` is already open.
+    pub fn is_open(&self, key: &str) -> bool {
+        self.sessions.iter().any(|s| s.key == key)
+    }
+
+    /// Open a new native RDP session for `params`, titled `title`, identified by
+    /// `key` (the saved connection id). Each session gets its own maximized OS
+    /// window.
+    pub fn open(&mut self, params: SessionParams, title: String, key: String) {
         let frame = Arc::new(Mutex::new(FrameState {
             status: Some(format!("Connecting to {}…", params.host)),
             ..Default::default()
@@ -67,6 +76,7 @@ impl NativeRdpManager {
         self.next_vp += 1;
         self.sessions.push(NativeSession {
             title,
+            key,
             vp,
             frame,
             input_tx,
@@ -99,23 +109,32 @@ impl NativeRdpManager {
         }
         self.sessions.retain(|s| s.open);
         if !self.sessions.is_empty() {
-            ctx.request_repaint();
+            // Cap the redraw at ~60fps instead of spinning the whole app at the
+            // display's max rate while an RDP window is open.
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 }
 
 impl NativeSession {
     fn render(&mut self, ui: &mut egui::Ui) {
-        // Refresh the texture from the newest framebuffer snapshot.
-        let (status, finished) = {
+        // Snapshot the newest framebuffer under the lock, then release it before
+        // the (potentially slow) GPU texture upload so the protocol thread isn't
+        // blocked writing the next frame.
+        let (new_image, status, finished) = {
             let f = self.frame.lock().unwrap();
-            if f.generation != self.last_generation && f.width > 0 {
-                let image = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
-                self.texture = Some(ui.ctx().load_texture("rdp-desktop", image, egui::TextureOptions::LINEAR));
+            let new_image = if f.generation != self.last_generation && f.width > 0 {
+                let img = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
                 self.last_generation = f.generation;
-            }
-            (f.status.clone(), f.finished)
+                Some(img)
+            } else {
+                None
+            };
+            (new_image, f.status.clone(), f.finished)
         };
+        if let Some(image) = new_image {
+            self.texture = Some(ui.ctx().load_texture("rdp-desktop", image, egui::TextureOptions::LINEAR));
+        }
 
         if let Some(msg) = status {
             ui.horizontal(|ui| {

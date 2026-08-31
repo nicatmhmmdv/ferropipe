@@ -442,40 +442,14 @@ impl FerropipeApp {
         self.console_input.clear();
     }
 
+    /// Connect the in-app file browser to `id`. Only SSH/SMB/WinRM browse files;
+    /// RDP kinds open a session window instead, so they delegate to open_session.
     fn connect(&mut self, ctx: &egui::Context, id: Uuid) {
         let Some(conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
             return;
         };
-        // RDP connections launch the external Remmina client instead of an in-app session.
-        if conn.kind == ConnectionKind::Rdp {
-            self.selected_conn = Some(id);
-            let password = match &conn.auth {
-                AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let config_dir = self
-                .store_path
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."));
-            match crate::rdp::launch(&conn, &password, &config_dir) {
-                Ok(_) => self.toast(ctx, format!("Launched Remmina → {}", conn.name), false),
-                Err(e) => self.toast(ctx, format!("RDP: {e:#}"), true),
-            }
-            return;
-        }
-        // Native RDP: open an in-app session via ferropipe-rdp (no external tool).
-        if conn.kind == ConnectionKind::RdpNative {
-            self.selected_conn = Some(id);
-            let password = match &conn.auth {
-                AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let mut params = ferropipe_rdp::session::SessionParams::new(&conn.host, &conn.username, &password);
-            params.port = conn.port;
-            params.domain = conn.domain.clone();
-            self.native_rdp.open(params, format!("RDP — {}", conn.name));
-            self.toast(ctx, format!("Opening native RDP → {}", conn.name), false);
+        if matches!(conn.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative) {
+            self.open_session(ctx, id);
             return;
         }
         if self.connecting {
@@ -529,14 +503,25 @@ impl FerropipeApp {
                 }
             }
             ConnectionKind::Rdp | ConnectionKind::RdpNative => {
+                // Don't spawn a second window for a connection that's already open.
+                let key = conn.id.to_string();
+                if self.native_rdp.is_open(&key) {
+                    self.toast(ctx, format!("{} is already open", conn.name), false);
+                    return;
+                }
                 let password = match &conn.auth {
                     AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
                     _ => String::new(),
                 };
+                // The native client authenticates via NLA and can't prompt, so a
+                // missing password will just fail — warn rather than silently retry.
+                if password.is_empty() {
+                    self.toast(ctx, format!("No saved password for {} — auth will fail", conn.name), true);
+                }
                 let mut params = ferropipe_rdp::session::SessionParams::new(&conn.host, &conn.username, &password);
                 params.port = conn.port;
                 params.domain = conn.domain.clone();
-                self.native_rdp.open(params, format!("RDP — {}", conn.name));
+                self.native_rdp.open(params, format!("RDP — {}", conn.name), key);
                 self.toast(ctx, format!("Opening RDP → {}", conn.name), false);
             }
             ConnectionKind::Smb | ConnectionKind::WinRm => {
