@@ -155,8 +155,7 @@ impl NativeSession {
 fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: Receiver<InputBatch>) {
     let mut session = match RdpSession::connect(&params) {
         Ok(s) => {
-            let mut f = frame.lock().unwrap();
-            f.status = Some("Connected".to_string());
+            frame.lock().unwrap().status = Some("Connected".to_string());
             s
         }
         Err(e) => {
@@ -166,6 +165,27 @@ fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: R
             return;
         }
     };
+
+    // Best-effort UDP multitransport upgrade (RDP over UDP). If the server offers
+    // it and the sideband comes up, graphics ride rdpeudp; otherwise the session
+    // stays on the reliable TCP path — same as a real RDP client's fallback.
+    if let Some(req) = session.multitransport_request() {
+        frame.lock().unwrap().status = Some("Negotiating UDP transport…".to_string());
+        let peer: Option<std::net::SocketAddr> = format!("{}:{}", params.host, params.port).parse().ok();
+        let local: Option<std::net::SocketAddr> = "0.0.0.0:0".parse().ok();
+        let isn = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0x1234_5678);
+        let msg = match (peer, local) {
+            (Some(peer), Some(local)) => match session.enable_udp(&req, local, peer, isn) {
+                Ok(()) => "Connected — RDP over UDP".to_string(),
+                Err(_) => "Connected (TCP; UDP unavailable)".to_string(),
+            },
+            _ => "Connected (TCP)".to_string(),
+        };
+        frame.lock().unwrap().status = Some(msg);
+    }
 
     loop {
         while let Ok(events) = input_rx.try_recv() {
