@@ -729,13 +729,13 @@ impl FerropipeApp {
                         }
                         let can_send = !busy && !panel.files.is_empty();
                         if ui.add_enabled(can_send, egui::Button::new(format!("Transfer {} file(s)", panel.files.len()))).clicked() {
-                            let (host, user, pw) = (panel.conn.host.clone(), panel.conn.username.clone(), panel.password.clone());
+                            let (conn, pw) = (panel.conn.clone(), panel.password.clone());
                             let (dir, files) = (panel.remote_dir.clone(), panel.files.clone());
-                            panel.run_bg("Transferring over SFTP…", move || {
-                                match crate::winssh::transfer(&host, &user, &pw, &dir, &files) {
-                                    Ok(r) if r.failures.is_empty() => format!("✓ Transferred {} file(s) to {dir}.", r.ok),
-                                    Ok(r) => format!(
-                                        "Transferred {} ok, {} failed: {}",
+                            panel.run_bg("Transferring (SFTP, or WinRM if SSH is off)…", move || {
+                                match crate::winssh::transfer(&conn, &pw, &dir, &files) {
+                                    Ok((chan, r)) if r.failures.is_empty() => format!("✓ Transferred {} file(s) to {dir} over {chan}.", r.ok),
+                                    Ok((chan, r)) => format!(
+                                        "{chan}: transferred {} ok, {} failed: {}",
                                         r.ok,
                                         r.failures.len(),
                                         r.failures.iter().map(|(n, e)| format!("{n} ({e})")).collect::<Vec<_>>().join("; ")

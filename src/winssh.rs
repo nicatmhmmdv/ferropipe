@@ -23,35 +23,56 @@ pub const WINRM_PORT: u16 = 5985;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// PowerShell (Administrator) to install + start the OpenSSH server and open the
-/// firewall. Idempotent.
-pub const ENABLE_SSH_PS: &str = "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null; Start-Service sshd; Set-Service -Name sshd -StartupType Manual; New-NetFirewallRule -Name ferropipe-sshd -DisplayName 'Ferropipe OpenSSH' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null; 'ssh enabled'";
+// Each script ends with an "OK: …" or "FAIL: …" line so we can report the real
+// outcome regardless of exit-code/stderr quirks across the WinRM and SSH
+// channels — the earlier version printed "enabled" unconditionally and lied when
+// the FoD install silently failed.
 
-/// PowerShell (Administrator) to stop the OpenSSH server and close the firewall.
-/// Leaves the capability installed so re-enabling is instant.
-pub const DISABLE_SSH_PS: &str = "Stop-Service sshd -ErrorAction SilentlyContinue; Set-Service -Name sshd -StartupType Disabled -ErrorAction SilentlyContinue; Remove-NetFirewallRule -Name ferropipe-sshd -ErrorAction SilentlyContinue; 'ssh disabled'";
+/// PowerShell (Administrator): install (if needed) + start the OpenSSH server,
+/// open the firewall, and verify it's actually Running. Reports FAIL with the
+/// reason (e.g. no Windows Update/FoD source) rather than claiming success.
+pub const ENABLE_SSH_PS: &str = "$ErrorActionPreference='SilentlyContinue'; if(-not(Get-Service sshd)){ Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null }; if(-not(Get-Service sshd)){ Write-Output 'FAIL: OpenSSH is not installed and could not be installed via Windows Update/Features-on-Demand (this host has no WU/FoD source). Use SMB or WinRM to transfer files instead.'; exit 0 }; Set-Service -Name sshd -StartupType Automatic; Start-Service sshd; New-NetFirewallRule -Name ferropipe-sshd -DisplayName 'Ferropipe OpenSSH' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null; Start-Sleep -Milliseconds 700; $s=(Get-Service sshd).Status; if($s -eq 'Running'){ Write-Output 'OK: sshd is Running on port 22' } else { Write-Output \"FAIL: sshd status is $s\" }";
 
-/// PowerShell (Administrator) to enable WinRM/PSRemoting (works on Public network
-/// profiles too, for workgroup hosts).
-pub const ENABLE_WINRM_PS: &str = "Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null; 'winrm enabled'";
+/// PowerShell (Administrator): stop the OpenSSH server, block startup, close the
+/// firewall, and verify it stopped.
+pub const DISABLE_SSH_PS: &str = "$ErrorActionPreference='SilentlyContinue'; Stop-Service sshd; Set-Service -Name sshd -StartupType Disabled; Remove-NetFirewallRule -Name ferropipe-sshd; $s=(Get-Service sshd); if($s -and $s.Status -eq 'Running'){ Write-Output 'FAIL: sshd is still Running' } else { Write-Output 'OK: sshd stopped' }";
 
-/// PowerShell (Administrator) to disable WinRM: stop the service, block startup,
-/// and disable its firewall rules. Run this over SSH when possible — doing it
-/// over WinRM itself severs the channel mid-command.
-pub const DISABLE_WINRM_PS: &str = "Disable-PSRemoting -Force -ErrorAction SilentlyContinue; Get-NetFirewallRule -DisplayGroup 'Windows Remote Management' -ErrorAction SilentlyContinue | Disable-NetFirewallRule -ErrorAction SilentlyContinue; Set-Service -Name WinRM -StartupType Disabled -ErrorAction SilentlyContinue; Stop-Service WinRM -Force -ErrorAction SilentlyContinue; 'winrm disabled'";
+/// PowerShell (Administrator): enable WinRM/PSRemoting (Public profiles too) and
+/// verify the service is Running.
+pub const ENABLE_WINRM_PS: &str = "$ErrorActionPreference='SilentlyContinue'; Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null; if((Get-Service WinRM).Status -eq 'Running'){ Write-Output 'OK: WinRM is Running' } else { Write-Output 'FAIL: WinRM did not start' }";
+
+/// PowerShell (Administrator): disable WinRM. Run over SSH when possible — doing
+/// it over WinRM severs the channel mid-command (the OK line may not return).
+pub const DISABLE_WINRM_PS: &str = "$ErrorActionPreference='SilentlyContinue'; Disable-PSRemoting -Force; Get-NetFirewallRule -DisplayGroup 'Windows Remote Management' | Disable-NetFirewallRule; Set-Service -Name WinRM -StartupType Disabled; Write-Output 'OK: WinRM disabled'; Stop-Service WinRM -Force";
 
 /// Enable/disable the OpenSSH server on the host. Prefers WinRM (SSH may be off,
 /// and disabling SSH over SSH would sever the channel).
 pub fn set_ssh_enabled(conn: &Connection, password: &str, enable: bool) -> Result<String> {
     let script = if enable { ENABLE_SSH_PS } else { DISABLE_SSH_PS };
-    run_ps_any(conn, password, script, false)
+    interpret(run_ps_any(conn, password, script, false)?)
 }
 
 /// Enable/disable WinRM on the host. Prefers SSH (WinRM is off when enabling, and
 /// disabling WinRM over WinRM severs the channel).
 pub fn set_winrm_enabled(conn: &Connection, password: &str, enable: bool) -> Result<String> {
     let script = if enable { ENABLE_WINRM_PS } else { DISABLE_WINRM_PS };
-    run_ps_any(conn, password, script, true)
+    interpret(run_ps_any(conn, password, script, true)?)
+}
+
+/// Turn a script's trailing "OK: …" / "FAIL: …" line into a Result: OK → the
+/// message, FAIL → an error carrying the reason.
+fn interpret(out: String) -> Result<String> {
+    let marker = out
+        .lines()
+        .rev()
+        .find(|l| l.contains("OK:") || l.contains("FAIL:"));
+    match marker {
+        Some(l) if l.contains("FAIL:") => {
+            Err(anyhow!("{}", l.splitn(2, "FAIL:").nth(1).unwrap_or(l).trim()))
+        }
+        Some(l) => Ok(l.splitn(2, "OK:").nth(1).unwrap_or(l).trim().to_string()),
+        None => Ok(out.trim().to_string()),
+    }
 }
 
 /// Run a PowerShell script over whichever remote channel is reachable. Tries the
@@ -158,8 +179,28 @@ fn ssh_session(host: &str, username: &str, password: &str) -> Result<Session> {
     Ok(session)
 }
 
-/// Upload `files` to `remote_dir` on `host` (port 22) using password auth.
+/// Upload `files` to `remote_dir`, preferring SFTP (fast) and falling back to
+/// WinRM when SSH isn't available (e.g. OpenSSH can't be installed on the host).
+/// Returns the channel used alongside the per-file outcome.
 pub fn transfer(
+    conn: &Connection,
+    password: &str,
+    remote_dir: &str,
+    files: &[PathBuf],
+) -> Result<(&'static str, TransferResult)> {
+    match transfer_sftp(&conn.host, &conn.username, password, remote_dir, files) {
+        Ok(r) => Ok(("SFTP", r)),
+        Err(ssh_err) => match transfer_winrm(conn, password, remote_dir, files) {
+            Ok(r) => Ok(("WinRM", r)),
+            Err(winrm_err) => Err(anyhow!(
+                "no transfer channel worked — SFTP: {ssh_err:#}; WinRM: {winrm_err:#}"
+            )),
+        },
+    }
+}
+
+/// Upload over SFTP (port 22, password auth).
+fn transfer_sftp(
     host: &str,
     username: &str,
     password: &str,
@@ -175,16 +216,55 @@ pub fn transfer(
     for local in files {
         match upload_one(&sftp, local, &dir) {
             Ok(()) => ok += 1,
-            Err(e) => failures.push((
-                local
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| local.display().to_string()),
-                format!("{e:#}"),
-            )),
+            Err(e) => failures.push((file_label(local), format!("{e:#}"))),
         }
     }
     Ok(TransferResult { ok, failures })
+}
+
+/// Upload over WinRM (chunked, via `winrm-rs`). Relative `remote_dir` is resolved
+/// under the login profile (%USERPROFILE%).
+fn transfer_winrm(
+    conn: &Connection,
+    password: &str,
+    remote_dir: &str,
+    files: &[PathBuf],
+) -> Result<TransferResult> {
+    use crate::remote::RemoteFs;
+    let mut winrm_conn = conn.clone();
+    winrm_conn.port = WINRM_PORT;
+    let fs = crate::remote::winrm::WinRmFs::connect(&winrm_conn, Some(password))
+        .map_err(|e| anyhow!("WinRM connect: {e:#}"))?;
+
+    let dir = normalize_dir(remote_dir);
+    let base = if dir == "." {
+        fs.home()
+    } else if dir.contains(':') {
+        dir // absolute Windows path
+    } else {
+        format!("{}/{}", fs.home().trim_end_matches('/'), dir)
+    };
+
+    let mut ok = 0usize;
+    let mut failures = Vec::new();
+    for local in files {
+        let remote = format!("{}/{}", base.trim_end_matches('/'), file_label(local));
+        let result = std::fs::File::open(local)
+            .map_err(|e| anyhow!("open {}: {e}", local.display()))
+            .and_then(|mut f| fs.write_file(&remote, &mut f, &mut |_| {}));
+        match result {
+            Ok(()) => ok += 1,
+            Err(e) => failures.push((file_label(local), format!("{e:#}"))),
+        }
+    }
+    Ok(TransferResult { ok, failures })
+}
+
+fn file_label(local: &Path) -> String {
+    local
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| local.display().to_string())
 }
 
 fn upload_one(sftp: &ssh2::Sftp, local: &Path, remote_dir: &str) -> Result<()> {
