@@ -86,6 +86,10 @@ fn profile_text(conn: &Connection, password: &str) -> String {
         format!("{}:{}", conn.host, conn.port)
     };
     let pw_b64 = encode_password(password);
+    // Redirect the user's home directory into the session so files can be dragged
+    // both ways — it shows up in Windows as a drive under \\tsclient (This PC).
+    // clipboard is also on, for quick copy/paste of individual files.
+    let share = std::env::var("HOME").unwrap_or_default();
     // colordepth=66 → "GFX AVC444"; network=autodetect adapts encoding to the link.
     format!(
         "[remmina]\n\
@@ -102,6 +106,8 @@ fn profile_text(conn: &Connection, password: &str) -> String {
          microphone=0\n\
          glyph-cache=1\n\
          disableclipboard=0\n\
+         sharefolder={share}\n\
+         drive={share}\n\
          disable-smooth-scrolling=0\n\
          cert_ignore=1\n\
          ignore-tls-errors=1\n\
@@ -113,6 +119,7 @@ fn profile_text(conn: &Connection, password: &str) -> String {
         user = conn.username,
         domain = conn.domain,
         pw = pw_b64,
+        share = share,
     )
 }
 
