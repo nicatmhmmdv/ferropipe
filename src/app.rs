@@ -514,33 +514,59 @@ impl FerropipeApp {
                     Err(e) => self.toast(ctx, format!("terminal: {e:#}"), true),
                 }
             }
-            ConnectionKind::Rdp | ConnectionKind::RdpNative => {
-                // Don't spawn a second window for a connection that's already open.
-                let key = conn.id.to_string();
-                if self.native_rdp.is_open(&key) {
-                    self.toast(ctx, format!("{} is already open", conn.name), false);
-                    return;
-                }
-                let password = match &conn.auth {
-                    AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                // The native client authenticates via NLA and can't prompt, so a
-                // missing password will just fail — warn rather than silently retry.
-                if password.is_empty() {
-                    self.toast(ctx, format!("No saved password for {} — auth will fail", conn.name), true);
-                }
-                let mut params = ferropipe_rdp::session::SessionParams::new(&conn.host, &conn.username, &password);
-                params.port = conn.port;
-                params.domain = conn.domain.clone();
-                self.native_rdp.open(params, format!("RDP — {}", conn.name), key);
-                self.toast(ctx, format!("Opening RDP → {}", conn.name), false);
-            }
+            // The mature path: launch Remmina (fast, renders GFX/H.264). This is
+            // what a plain "RDP" connection is for.
+            ConnectionKind::Rdp => self.launch_remmina(ctx, &conn),
+            // The experimental in-app client — explicit opt-in via the RdpNative kind.
+            ConnectionKind::RdpNative => self.open_native_rdp(ctx, &conn),
             ConnectionKind::Smb | ConnectionKind::WinRm => {
                 // File-oriented kinds open the in-app dual-pane browser.
                 self.connect(ctx, id);
             }
         }
+    }
+
+    /// Launch the external Remmina client for `conn` (the mature RDP path).
+    fn launch_remmina(&mut self, ctx: &egui::Context, conn: &Connection) {
+        let password = match &conn.auth {
+            AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let config_dir = self
+            .store_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        match crate::rdp::launch(conn, &password, &config_dir) {
+            Ok(_) => self.toast(ctx, format!("Launched Remmina → {}", conn.name), false),
+            Err(e) => self.toast(ctx, format!("RDP: {e:#}"), true),
+        }
+    }
+
+    /// Open the experimental in-app native RDP client for `conn` in its own
+    /// maximized window. Still work-in-progress: no EGFX/H.264 decode yet, so
+    /// GFX-mandatory hosts render black — use Remmina for those.
+    fn open_native_rdp(&mut self, ctx: &egui::Context, conn: &Connection) {
+        // Don't spawn a second window for a connection that's already open.
+        let key = conn.id.to_string();
+        if self.native_rdp.is_open(&key) {
+            self.toast(ctx, format!("{} is already open", conn.name), false);
+            return;
+        }
+        let password = match &conn.auth {
+            AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
+            _ => String::new(),
+        };
+        // The native client authenticates via NLA and can't prompt, so a missing
+        // password will just fail — warn rather than silently retry.
+        if password.is_empty() {
+            self.toast(ctx, format!("No saved password for {} — auth will fail", conn.name), true);
+        }
+        let mut params = ferropipe_rdp::session::SessionParams::new(&conn.host, &conn.username, &password);
+        params.port = conn.port;
+        params.domain = conn.domain.clone();
+        self.native_rdp.open(params, format!("RDP — {}", conn.name), key);
+        self.toast(ctx, format!("Opening native RDP → {}", conn.name), false);
     }
 
     fn disconnect(&mut self) {
@@ -1394,27 +1420,20 @@ impl FerropipeApp {
                 self.connect(ctx, c.id);
                 ui.close();
             }
-            // Windows connections can fall back to the external Remmina client.
-            if matches!(c.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative)
-                && ui.button("Open in Remmina").clicked()
-            {
-                self.selected_conn = Some(c.id);
-                let password = match &c.auth {
-                    AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let config_dir = self
-                    .store_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("."));
+            // RDP connections can pick either client explicitly, regardless of kind.
+            if matches!(c.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative) {
                 let mut c = c.clone();
                 c.host = c.effective_host();
-                match crate::rdp::launch(&c, &password, &config_dir) {
-                    Ok(_) => self.toast(ctx, format!("Launched Remmina → {}", c.name), false),
-                    Err(e) => self.toast(ctx, format!("RDP: {e:#}"), true),
+                if ui.button("Open in Remmina").clicked() {
+                    self.selected_conn = Some(c.id);
+                    self.launch_remmina(ctx, &c);
+                    ui.close();
                 }
-                ui.close();
+                if ui.button("Open in native RDP (experimental)").clicked() {
+                    self.selected_conn = Some(c.id);
+                    self.open_native_rdp(ctx, &c);
+                    ui.close();
+                }
             }
             if ui.button("Edit").clicked() {
                 self.editor = Some(editor_from(c, &self.vault));

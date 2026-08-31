@@ -9,12 +9,73 @@
 use crate::model::Connection;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Directory where generated Remmina profiles are stored.
 fn profiles_dir(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join("rdp-profiles")
+}
+
+/// Read Remmina's `secret=` key from `~/.config/remmina/remmina.pref`. This is the
+/// base64 of a 32-byte value (24-byte 3DES key + 8-byte IV) Remmina uses to
+/// encrypt profile passwords.
+fn remmina_secret() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let pref = Path::new(&home).join(".config/remmina/remmina.pref");
+    let content = std::fs::read_to_string(pref).ok()?;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("secret=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Encrypt a password the way Remmina's `remmina_crypt_encrypt` does, so a
+/// generated profile can supply credentials without prompting: 3DES-CBC (EDE3)
+/// with key = secret[0..24], IV = secret[24..32], zero-padded to a multiple of 8
+/// (always adding at least one byte), then base64. Returns `None` if the secret
+/// can't be decoded (caller falls back to the kiosk base64 format).
+fn remmina_encrypt(password: &str, secret_b64: &str) -> Option<String> {
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::generic_array::GenericArray;
+    type Enc = cbc::Encryptor<des::TdesEde3>;
+
+    let secret = B64.decode(secret_b64.trim()).ok()?;
+    if secret.len() < 32 {
+        return None;
+    }
+    let key: [u8; 24] = secret[0..24].try_into().ok()?;
+    let iv: [u8; 8] = secret[24..32].try_into().ok()?;
+
+    let pw = password.as_bytes();
+    // Remmina pads to a multiple of the 8-byte DES block, always adding ≥1 zero.
+    let padded_len = pw.len() + (8 - pw.len() % 8);
+    let mut buf = vec![0u8; padded_len];
+    buf[..pw.len()].copy_from_slice(pw);
+
+    let mut enc = Enc::new(&key.into(), &iv.into());
+    for chunk in buf.chunks_mut(8) {
+        enc.encrypt_block_mut(GenericArray::from_mut_slice(chunk));
+    }
+    Some(B64.encode(&buf))
+}
+
+/// Encode a password for a Remmina profile's `password=` field. Uses Remmina's
+/// own 3DES scheme when its secret is available (so Remmina decrypts it and
+/// connects without prompting); otherwise the kiosk base64 fallback, or "." to
+/// let Remmina prompt when there's no password at all.
+fn encode_password(password: &str) -> String {
+    if password.is_empty() {
+        return ".".to_string();
+    }
+    remmina_secret()
+        .and_then(|s| remmina_encrypt(password, &s))
+        .unwrap_or_else(|| B64.encode(password))
 }
 
 /// Build the `.remmina` profile text for a connection.
@@ -24,12 +85,7 @@ fn profile_text(conn: &Connection, password: &str) -> String {
     } else {
         format!("{}:{}", conn.host, conn.port)
     };
-    let pw_b64 = if password.is_empty() {
-        // "." tells Remmina to prompt / use its own secret store.
-        ".".to_string()
-    } else {
-        B64.encode(password)
-    };
+    let pw_b64 = encode_password(password);
     // colordepth=66 → "GFX AVC444"; network=autodetect adapts encoding to the link.
     format!(
         "[remmina]\n\
@@ -93,4 +149,34 @@ fn which(bin: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|p| p.join(bin))
         .find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remmina_encrypt_matches_reference() {
+        // Cross-checked against `openssl enc -des-ede3-cbc -nopad` with a fixed
+        // key/iv (secret = bytes 0..=31) and password "secret" (zero-padded to 8).
+        // This pins the exact byte layout Remmina's remmina_crypt_encrypt uses.
+        let secret_b64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let got = remmina_encrypt("secret", secret_b64);
+        assert_eq!(got.as_deref(), Some("lHQN3eia3Uw="));
+    }
+
+    #[test]
+    fn remmina_encrypt_pads_exact_block_multiple() {
+        // An 8-char password must still get a full extra padding block (Remmina
+        // always adds ≥1 byte), so the ciphertext is 16 bytes → 24 base64 chars.
+        let secret_b64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let out = remmina_encrypt("password", secret_b64).unwrap();
+        let raw = B64.decode(out).unwrap();
+        assert_eq!(raw.len(), 16, "8-byte input pads to two 8-byte blocks");
+    }
+
+    #[test]
+    fn encode_password_empty_is_dot() {
+        assert_eq!(encode_password(""), ".");
+    }
 }
