@@ -65,7 +65,14 @@ impl RemoteFs for SmbFs {
     }
 
     fn list(&self, path: &str) -> Result<Vec<FileEntry>> {
-        let p = norm(path);
+        // The server root (the share list) must be the *bare* server URL:
+        // libsmbclient enumerates shares from an empty path and rejects a "/"
+        // path ("smb://host/") with EBADF. Inside a share, paths are used as-is.
+        let p = if path.is_empty() || path == "/" {
+            String::new()
+        } else {
+            norm(path)
+        };
         // Prefer list_dirplus (gives size + mtime); fall back to list_dir (e.g. at the
         // server root where entries are shares, not files).
         if let Ok(infos) = self.client.list_dirplus(&p) {
