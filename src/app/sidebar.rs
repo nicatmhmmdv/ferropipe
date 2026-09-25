@@ -118,19 +118,15 @@ impl FerropipeApp {
         let p = theme::current(ui);
         let (status, err) = self.host_status(c.id);
         let selected = self.selected_conn == Some(c.id);
-        // The drag source senses drags on a widget of its own laid over the
-        // row, so the row's click sense (select / open / menu) is untouched.
-        let drag_id = Id::new(("host-drag", c.id));
-        let resp = ui
-            .dnd_drag_source(drag_id, HostPayload { id: c.id }, |ui| {
-                let (rect, resp) = widgets::row_slot(ui, HOST_ROW_H, selected, p.bg2);
-                widgets::color_stripe(ui, rect, c.color);
-                let mut row = widgets::row_ui(ui, rect, ROW_PAD_LEFT, ROW_PAD_RIGHT);
-                host_row_contents(&mut row, c, status, err.as_deref());
-                resp
-            })
-            .inner
-            .on_hover_text(c.target());
+        // The row senses click *and* drag itself: a drag-source wrapper laid
+        // over a click-only row makes egui drop the click (see widgets::host).
+        let payload = HostPayload { id: c.id };
+        let (rect, resp) =
+            widgets::drag_row_slot(ui, HOST_ROW_H, selected, p.bg2, payload, &c.name);
+        widgets::color_stripe(ui, rect, c.color);
+        let mut row = widgets::row_ui(ui, rect, ROW_PAD_LEFT, ROW_PAD_RIGHT);
+        host_row_contents(&mut row, c, status, err.as_deref());
+        let resp = resp.on_hover_text(c.target());
         if resp.clicked() {
             self.selected_conn = Some(c.id);
         }

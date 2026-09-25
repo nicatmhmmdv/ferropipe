@@ -23,7 +23,8 @@ mod transfer;
 
 pub use fkeys::{FKEY_BAR_H, FKeyAction, FKeyContext, fkey_action, fkey_bar, fkey_enabled};
 pub use host::{
-    HostStatus, color_stripe, host_selector, protocol_chip, row_slot, row_ui, status_dot,
+    HostStatus, color_stripe, drag_row_slot, host_selector, protocol_chip, row_slot, row_ui,
+    status_dot,
 };
 pub use misc::{dashed_outline, empty_pane, icon_button, primary_button, section_label, toast};
 pub use path::{PathAction, path_bar};

@@ -19,7 +19,13 @@ echo "==> Installing icon"
 install -Dm644 "$here/assets/ferropipe.svg" "$icondir/ferropipe.svg"
 
 echo "==> Installing desktop entry"
-install -Dm644 "$here/assets/ferropipe.desktop" "$appdir/ferropipe.desktop"
+# Absolute Exec/TryExec: GNOME and GLib drop a desktop entry whose binary is
+# not on the *shell's* PATH, and ~/.local/bin often is not.
+mkdir -p "$appdir"
+sed -e "s|^Exec=ferropipe|Exec=$bindir/ferropipe|" \
+    -e "s|^Icon=ferropipe|Icon=ferropipe\nTryExec=$bindir/ferropipe|" \
+    "$here/assets/ferropipe.desktop" > "$appdir/ferropipe.desktop"
+chmod 644 "$appdir/ferropipe.desktop"
 
 # Refresh caches so it appears in the launcher/search immediately.
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$appdir" || true
