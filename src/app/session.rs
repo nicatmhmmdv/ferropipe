@@ -3,18 +3,25 @@
 
 use super::*;
 
+/// Whether `side` browses a remote host, given each pane's mode flag: the
+/// left is local unless `left_remote`, the right remote unless `right_local`.
+pub(super) fn pane_is_remote(side: Side, left_remote: bool, right_local: bool) -> bool {
+    match side {
+        Side::Left => left_remote,
+        Side::Right => !right_local,
+    }
+}
+
 impl FerropipeApp {
-    /// Connect the in-app file browser to `id`. Only SSH/SMB/WinRM browse files;
-    /// RDP kinds open a session window instead, so they delegate to open_session.
-    pub(super) fn connect(&mut self, ctx: &egui::Context, id: Uuid) {
-        let Some(mut conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
-            return;
-        };
-        if matches!(conn.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative) {
-            self.open_session(ctx, id);
-            return;
-        }
-        // Resolve the effective host (falls back to the name); bail clearly if blank.
+    /// The saved host `id` with its effective address filled in (falls back
+    /// to the name); toasts and returns `None` when that is blank.
+    fn resolved_host(&mut self, ctx: &egui::Context, id: Uuid) -> Option<Connection> {
+        let mut conn = self
+            .store
+            .connections
+            .iter()
+            .find(|c| c.id == id)
+            .cloned()?;
         conn.host = conn.effective_host();
         if conn.host.is_empty() {
             self.toast(
@@ -22,29 +29,34 @@ impl FerropipeApp {
                 format!("{}: no host set — edit the connection", conn.name),
                 true,
             );
+            return None;
+        }
+        Some(conn)
+    }
+
+    /// Connect the in-app file browser to `id`. Only SSH/SMB/WinRM browse files;
+    /// RDP kinds open a session window instead, so they delegate to open_session.
+    pub(super) fn connect(&mut self, ctx: &egui::Context, id: Uuid) {
+        let Some(conn) = self.resolved_host(ctx, id) else {
+            return;
+        };
+        if matches!(conn.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative) {
+            self.open_session(ctx, id);
             return;
         }
         if self.connecting {
             self.toast(ctx, "Already connecting — please wait…", true);
             return;
         }
+        self.leave_right_local();
         // If already connected, drop the current session first. Commands are processed
         // in order, so the worker handles Disconnect and then the new Connect.
         if self.connected.is_some() {
             self.worker.send(Command::Disconnect);
-            self.connected = None;
-            self.remote.entries.clear();
-            self.remote.selected.clear();
-            self.remote.home = None;
+            self.clear_right_session();
         }
         self.host_errors.remove(&id);
-        let secret = match &conn.auth {
-            AuthMethod::Password { password_enc } => self.vault.decrypt(password_enc).ok(),
-            AuthMethod::Key { passphrase_enc, .. } => passphrase_enc
-                .as_ref()
-                .and_then(|b| self.vault.decrypt(b).ok()),
-            AuthMethod::Agent => None,
-        };
+        let secret = self.decrypt_secret(&conn);
         self.selected_conn = Some(id);
         self.pending_connect = Some(id);
         self.connecting = true;
@@ -60,20 +72,10 @@ impl FerropipeApp {
     /// session in its own window. SSH opens an Alacritty terminal; Windows/RDP
     /// opens a maximized native RDP window; SMB/WinRM open the in-app file pane.
     pub(super) fn open_session(&mut self, ctx: &egui::Context, id: Uuid) {
-        let Some(mut conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
+        let Some(conn) = self.resolved_host(ctx, id) else {
             return;
         };
         self.selected_conn = Some(id);
-        // Resolve the effective host (falls back to the name); bail clearly if blank.
-        conn.host = conn.effective_host();
-        if conn.host.is_empty() {
-            self.toast(
-                ctx,
-                format!("{}: no host set — edit the connection", conn.name),
-                true,
-            );
-            return;
-        }
         match conn.kind {
             ConnectionKind::Ssh => {
                 let target = format!("{}@{}", conn.username, conn.host);
@@ -153,14 +155,89 @@ impl FerropipeApp {
         self.toast(ctx, format!("Opening native RDP → {}", conn.name), false);
     }
 
+    /// Drop the right pane's session, leaving the pane empty ("Choose a host").
     pub(super) fn disconnect(&mut self) {
         self.worker.send(Command::Disconnect);
+        self.clear_right_session();
+        self.status = String::new();
+    }
+
+    /// Forget the right pane's session state; the worker is told separately.
+    fn clear_right_session(&mut self) {
         self.connected = None;
         self.connected_at = None;
+        self.connecting = false;
+        self.pending_connect = None;
+        self.remote.entries.clear();
+        self.remote.selected.clear();
+        self.remote.cwd = "/".into();
+        self.remote.home = None;
+        self.remote.error = None;
+        self.remote.loading = false;
+    }
+
+    /// The right pane is about to host a remote: remember its local
+    /// directory and empty the listing.
+    fn leave_right_local(&mut self) {
+        if !self.right_local {
+            return;
+        }
+        self.right_saved_cwd = self.remote.cwd.clone();
+        self.right_local = false;
+        self.remote.remote = true;
         self.remote.entries.clear();
         self.remote.selected.clear();
         self.remote.home = None;
-        self.status = String::new();
+        self.remote.error = None;
+    }
+
+    /// Put the right pane on the local filesystem, dropping its remote
+    /// session (or the connect still in flight) first.
+    pub(super) fn right_to_local(&mut self) {
+        if self.right_local {
+            return;
+        }
+        if self.connected.is_some() || self.connecting {
+            self.worker.send(Command::Disconnect);
+            self.clear_right_session();
+        }
+        self.right_local = true;
+        self.remote.remote = false;
+        self.remote.loading = false;
+        self.remote.entries.clear();
+        self.remote.selected.clear();
+        self.remote.cwd = if self.right_saved_cwd.is_empty() {
+            local_home()
+        } else {
+            self.right_saved_cwd.clone()
+        };
+        self.remote.home = Some(local_home());
+        let show_hidden = self.store.settings.show_hidden;
+        reload_local(&mut self.remote, show_hidden);
+    }
+
+    /// Put the left pane back on the local filesystem, dropping its remote session.
+    pub(super) fn left_to_local(&mut self) {
+        if self.left_remote || self.lconnecting {
+            self.lworker.send(Command::Disconnect);
+            self.revert_left_to_local(); // revert immediately, don't wait for the event
+        }
+    }
+
+    /// Show this computer in `side`.
+    pub(super) fn side_to_local(&mut self, side: Side) {
+        match side {
+            Side::Left => self.left_to_local(),
+            Side::Right => self.right_to_local(),
+        }
+    }
+
+    /// Browse host `id` in `side`.
+    pub(super) fn connect_side(&mut self, ctx: &egui::Context, side: Side, id: Uuid) {
+        match side {
+            Side::Left => self.connect_left(ctx, id),
+            Side::Right => self.connect(ctx, id),
+        }
     }
 
     fn decrypt_secret(&self, conn: &Connection) -> Option<String> {
@@ -174,22 +251,13 @@ impl FerropipeApp {
     }
 
     pub(super) fn connect_left(&mut self, ctx: &egui::Context, id: Uuid) {
-        let Some(mut conn) = self.store.connections.iter().find(|c| c.id == id).cloned() else {
+        let Some(conn) = self.resolved_host(ctx, id) else {
             return;
         };
         if matches!(conn.kind, ConnectionKind::Rdp | ConnectionKind::RdpNative) {
             self.toast(
                 ctx,
                 "RDP can't be used as a file pane — use SSH/SMB/WinRM",
-                true,
-            );
-            return;
-        }
-        conn.host = conn.effective_host();
-        if conn.host.is_empty() {
-            self.toast(
-                ctx,
-                format!("{}: no host set — edit the connection", conn.name),
                 true,
             );
             return;
@@ -292,6 +360,11 @@ impl FerropipeApp {
 
     /// A session came up: remember its home, clear any stale failure and list it.
     fn on_connected(&mut self, ctx: &egui::Context, side: Side, home: String, kind: &'static str) {
+        // The pane was put back on this computer while this connect was in
+        // flight; its Disconnect is already queued behind it.
+        if !self.side_is_remote(side) {
+            return;
+        }
         if side == Side::Left {
             self.lconnecting = false;
             self.lconnected = self.lpending.take();
@@ -314,7 +387,12 @@ impl FerropipeApp {
         self.side_send(side, Command::ListRemote { path: home });
     }
 
+    /// A remote listing arrived. One for a pane that has since gone back to
+    /// this computer is stale and must not replace the local listing.
     fn on_listing(&mut self, side: Side, path: String, mut entries: Vec<FileEntry>) {
+        if !self.side_is_remote(side) {
+            return;
+        }
         let pane = self.side_pane_mut(side);
         pane.cwd = path;
         std::mem::swap(&mut pane.entries, &mut entries);
@@ -358,18 +436,18 @@ impl FerropipeApp {
         }
     }
 
+    /// A session ended. Nothing to tear down when the pane already went back
+    /// to this computer, or when a newer connect on it is in flight (the
+    /// event belongs to the session that connect replaced).
     fn on_disconnected(&mut self, side: Side) {
+        if !self.side_is_remote(side) || self.side_connecting(side) {
+            return;
+        }
         if side == Side::Left {
             self.revert_left_to_local();
             return;
         }
-        self.connected = None;
-        self.connected_at = None;
-        self.remote.entries.clear();
-        self.remote.selected.clear();
-        self.remote.cwd = "/".into();
-        self.remote.home = None;
-        self.remote.error = None;
+        self.clear_right_session();
         self.status = "Disconnected".into();
     }
 
@@ -389,11 +467,17 @@ impl FerropipeApp {
         }
     }
 
-    pub(super) fn side_is_remote(&self, side: Side) -> bool {
+    /// Whether a connect is in flight on `side`.
+    fn side_connecting(&self, side: Side) -> bool {
         match side {
-            Side::Left => self.left_remote,
-            Side::Right => true,
+            Side::Left => self.lconnecting,
+            Side::Right => self.connecting,
         }
+    }
+
+    /// Whether `side` browses a remote host (connected or not) rather than this computer.
+    pub(super) fn side_is_remote(&self, side: Side) -> bool {
+        pane_is_remote(side, self.left_remote, self.right_local)
     }
 
     pub(super) fn side_pane(&self, side: Side) -> &PaneState {
@@ -417,6 +501,8 @@ impl FerropipeApp {
         }
     }
 
+    /// Whether `side` has a live remote session. A local pane has none; use
+    /// `side_usable` for "can I act on this pane's listing".
     pub(super) fn side_connected(&self, side: Side) -> bool {
         match side {
             Side::Left => self.lconnected.is_some(),
@@ -436,5 +522,33 @@ impl FerropipeApp {
             let show_hidden = self.store.settings.show_hidden;
             reload_local(self.side_pane_mut(side), show_hidden);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- pane_is_remote ----------------------------------------------------
+
+    #[test]
+    fn pane_is_remote_left_follows_its_remote_flag() {
+        // Arrange / Act / Assert
+        assert!(pane_is_remote(Side::Left, true, false));
+        assert!(!pane_is_remote(Side::Left, false, false));
+    }
+
+    #[test]
+    fn pane_is_remote_right_is_remote_unless_put_on_this_computer() {
+        assert!(pane_is_remote(Side::Right, false, false));
+        assert!(!pane_is_remote(Side::Right, false, true));
+    }
+
+    #[test]
+    fn pane_is_remote_sides_do_not_influence_each_other() {
+        assert!(pane_is_remote(Side::Left, true, true));
+        assert!(!pane_is_remote(Side::Right, true, true));
+        assert!(!pane_is_remote(Side::Left, false, false));
+        assert!(pane_is_remote(Side::Right, false, false));
     }
 }

@@ -224,3 +224,94 @@ impl RemoteFs for SmbFs {
         Ok(())
     }
 }
+
+/// Live probe against a saved SMB host, opt-in: set `FERROPIPE_SMB_PROBE` to
+/// the saved connection's name and run
+/// `FERROPIPE_SMB_PROBE=<name> cargo test smb::live_probe -- --ignored --nocapture`.
+/// Reads the real store and vault, never prints the secret, and only writes one
+/// scratch file under `C$/Windows/Temp`, which it removes again.
+#[cfg(test)]
+mod live_probe {
+    use super::super::{download, upload};
+    use super::*;
+    use crate::model::{AuthMethod, ConnectionKind};
+    use std::path::PathBuf;
+
+    fn saved_smb_connection(name: &str) -> (Connection, String) {
+        let dirs = crate::store::project_dirs().expect("config dir");
+        let store = crate::store::Store::load(&crate::store::store_path(&dirs)).expect("store");
+        let key = crate::vault::default_key_path(dirs.config_dir());
+        let vault = crate::vault::Vault::load_or_create(&key).expect("vault");
+        let conn = store
+            .connections
+            .iter()
+            .find(|c| c.name == name && c.kind == ConnectionKind::Smb)
+            .cloned()
+            .expect("saved SMB connection with that name");
+        let secret = match &conn.auth {
+            AuthMethod::Password { password_enc } => vault.decrypt(password_enc).expect("decrypt"),
+            _ => String::new(),
+        };
+        (conn, secret)
+    }
+
+    fn names(entries: &[FileEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    #[ignore = "needs a saved SMB host on the network; see the module docs"]
+    fn smb_round_trip_against_saved_host() {
+        let Ok(name) = std::env::var("FERROPIPE_SMB_PROBE") else {
+            println!("FERROPIPE_SMB_PROBE not set; skipping");
+            return;
+        };
+        let (conn, secret) = saved_smb_connection(&name);
+        println!("[1] connecting to smb://{} as {}", conn.host, conn.username);
+        let fs = SmbFs::connect(&conn, Some(&secret)).expect("connect");
+        println!(
+            "[2] shares: {:?}",
+            names(&fs.list("/").expect("list shares"))
+        );
+        let win = fs.list("/C$/Windows").expect("list C$/Windows");
+        println!("[3] C$/Windows: {} entries", win.len());
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let quiet = |_e: super::super::Event| {};
+        download(
+            &fs,
+            1,
+            &["/C$/Windows/win.ini".to_string()],
+            tmp.path(),
+            &quiet,
+        )
+        .expect("download win.ini");
+        let bytes = std::fs::read(tmp.path().join("win.ini")).expect("downloaded file");
+        println!("[4] downloaded win.ini: {} bytes", bytes.len());
+        assert!(!bytes.is_empty());
+
+        let file = format!("ferropipe-probe-{}.txt", std::process::id());
+        let local: PathBuf = tmp.path().join(&file);
+        std::fs::write(&local, b"ferropipe smb probe\n").expect("write scratch");
+        upload(&fs, 2, &[local], "/C$/Windows/Temp", &quiet).expect("upload");
+        let remote_path = format!("/C$/Windows/Temp/{file}");
+        let temp = fs.list("/C$/Windows/Temp").expect("list Temp");
+        assert!(
+            names(&temp).contains(&file.as_str()),
+            "uploaded file not listed"
+        );
+        let mut back = Vec::new();
+        fs.read_file(&remote_path, &mut back, &mut |_| {})
+            .expect("read back");
+        assert_eq!(back, b"ferropipe smb probe\n");
+        println!("[5] uploaded, listed and read back {file}");
+
+        fs.remove_file(&remote_path).expect("remove scratch");
+        let temp = fs.list("/C$/Windows/Temp").expect("list Temp again");
+        assert!(
+            !names(&temp).contains(&file.as_str()),
+            "scratch file still there"
+        );
+        println!("[6] removed {file}");
+    }
+}

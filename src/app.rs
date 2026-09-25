@@ -17,6 +17,7 @@ mod dialogs;
 mod editor;
 mod fkeys;
 mod live_edit;
+mod local_copy;
 mod pane_actions;
 mod panes;
 mod session;
@@ -173,6 +174,7 @@ pub struct FerropipeApp {
 
     // Second session backing the LEFT pane when it hosts a remote host (for
     // remote-to-remote transfer). When `left_remote` is false the left pane is local.
+    // Either pane can show this computer; see `right_local` for the right one.
     left_remote: bool,
     lworker: WorkerHandle,
     lworker_join: Option<std::thread::JoinHandle<()>>,
@@ -183,6 +185,10 @@ pub struct FerropipeApp {
     lkind: &'static str,
     /// Local cwd to restore when the left pane reverts from remote to local.
     left_saved_cwd: String,
+    /// The right pane shows this computer instead of a host (its worker sits idle).
+    right_local: bool,
+    /// Local cwd to restore when the right pane goes back from a host to local.
+    right_saved_cwd: String,
     /// Remote→remote staging: source-download id → job describing the follow-up upload.
     stage_download: HashMap<u64, StageJob>,
     /// Upload id → temp dir to clean up once the staged upload completes.
@@ -301,6 +307,8 @@ impl FerropipeApp {
             lpending: None,
             lkind: "",
             left_saved_cwd: String::new(),
+            right_local: false,
+            right_saved_cwd: String::new(),
             stage_download: HashMap::new(),
             stage_cleanup: HashMap::new(),
             last_transfer_error: [None, None],

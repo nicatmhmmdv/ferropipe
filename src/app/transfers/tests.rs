@@ -9,6 +9,7 @@ fn transfer(id: u64, worker: Side) -> TransferState {
         label: "report.pdf".into(),
         dest: "web01:/srv".into(),
         upload: true,
+        verb: Verb::Upload,
         retry: None,
     };
     TransferState::new(id, spec, 10.0)
@@ -21,14 +22,33 @@ fn finished(t: &mut TransferState, at: f64, error: Option<&str>) {
     t.finished_at = Some(at);
 }
 
-fn done_snapshot(bytes_total: u64, elapsed: f64, error: Option<&str>) -> Finished {
+fn done_snapshot(verb: Verb, bytes_total: u64, elapsed: f64, error: Option<&str>) -> Finished {
     Finished {
         label: "report.pdf".into(),
-        upload: true,
+        verb,
+        dest: Side::Right,
         bytes_total,
         elapsed,
         error: error.map(str::to_string),
     }
+}
+
+// -- transfer_verb -----------------------------------------------------
+
+#[test]
+fn transfer_verb_is_download_from_a_remote_to_a_local_pane() {
+    assert_eq!(transfer_verb(true, false), Verb::Download);
+}
+
+#[test]
+fn transfer_verb_is_upload_from_a_local_to_a_remote_pane() {
+    assert_eq!(transfer_verb(false, true), Verb::Upload);
+}
+
+#[test]
+fn transfer_verb_is_copy_when_both_panes_share_a_mode() {
+    assert_eq!(transfer_verb(true, true), Verb::Copy);
+    assert_eq!(transfer_verb(false, false), Verb::Copy);
 }
 
 // -- transfer_label ----------------------------------------------------
@@ -296,9 +316,10 @@ fn summary_parts_is_empty_when_nothing_is_happening() {
 // -- error capture -----------------------------------------------------
 
 #[test]
-fn is_transfer_context_matches_only_upload_and_download() {
+fn is_transfer_context_matches_download_upload_and_copy() {
     assert!(is_transfer_context("download"));
     assert!(is_transfer_context("upload"));
+    assert!(is_transfer_context("copy"));
     assert!(!is_transfer_context("list /srv"));
     assert!(!is_transfer_context("connect"));
 }
@@ -316,38 +337,36 @@ fn attach_error_keeps_a_recent_message_and_drops_an_old_one() {
 
 #[test]
 fn result_toast_success_names_the_verb_size_and_time() {
-    let done = done_snapshot(2048, 1.26, None);
+    let done = done_snapshot(Verb::Upload, 2048, 1.26, None);
     assert_eq!(
-        result_toast(Verb::Upload, &done),
+        result_toast(&done),
         (
             "Uploaded report.pdf".to_string(),
             Some("2.0 KB · 1.3 s".to_string())
         )
     );
-    assert_eq!(
-        result_toast(Verb::Download, &done).0,
-        "Downloaded report.pdf"
-    );
-    assert_eq!(result_toast(Verb::Copy, &done).0, "Copied report.pdf");
+    let done = done_snapshot(Verb::Download, 2048, 1.26, None);
+    assert_eq!(result_toast(&done).0, "Downloaded report.pdf");
+    let done = done_snapshot(Verb::Copy, 2048, 1.26, None);
+    assert_eq!(result_toast(&done).0, "Copied report.pdf");
 }
 
 #[test]
 fn result_toast_success_without_a_size_shows_only_the_time() {
-    let done = done_snapshot(0, 0.4, None);
-    assert_eq!(result_toast(Verb::Copy, &done).1, Some("0.4 s".to_string()));
+    let done = done_snapshot(Verb::Copy, 0, 0.4, None);
+    assert_eq!(result_toast(&done).1, Some("0.4 s".to_string()));
 }
 
 #[test]
 fn result_toast_failure_shortens_the_error_and_has_no_detail() {
-    let done = done_snapshot(2048, 1.0, Some("Error: permission denied\nmore"));
+    let error = Some("Error: permission denied\nmore");
+    let done = done_snapshot(Verb::Upload, 2048, 1.0, error);
     assert_eq!(
-        result_toast(Verb::Upload, &done),
+        result_toast(&done),
         ("Upload failed: permission denied".to_string(), None)
     );
-    assert_eq!(
-        result_toast(Verb::Copy, &done).0,
-        "Copy failed: permission denied"
-    );
+    let done = done_snapshot(Verb::Copy, 2048, 1.0, error);
+    assert_eq!(result_toast(&done).0, "Copy failed: permission denied");
 }
 
 // -- retry_allowed -----------------------------------------------------

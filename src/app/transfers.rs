@@ -3,16 +3,17 @@
 //!
 //! Pure helpers (labels, phase, rate, status text, pruning, toast copy) sit at
 //! the top and are unit-tested; the `FerropipeApp` methods below them wire the
-//! worker events, the drawer actions and the two gutter arrows.
+//! worker events and the drawer actions. The gutter arrows live in `gutter`,
+//! local → local copies in `super::local_copy`.
 
 use super::*;
 use crate::localfs::human_size;
 use crate::remote::TransferProgress;
-use crate::theme::{self, GUTTER_W};
+use crate::theme;
 use crate::widgets::{self, TransferAction, TransferPhase, TransferView};
-use egui::{
-    Align, FontFamily, FontId, Frame, Label, Layout, Margin, Rangef, ScrollArea, Stroke, Ui,
-};
+use egui::{Align, FontFamily, FontId, Frame, Label, Layout, Margin, ScrollArea, Ui};
+
+mod gutter;
 
 /// Seconds a completed transfer lingers in the drawer before it is pruned.
 const DONE_LINGER_SECS: f64 = 3.0;
@@ -20,8 +21,6 @@ const DONE_LINGER_SECS: f64 = 3.0;
 const RATE_MIN_ELAPSED_SECS: f64 = 0.5;
 /// A worker error older than this is not attached to a failed transfer.
 const ERROR_ATTACH_WINDOW_SECS: f64 = 2.0;
-/// Space above the gutter arrows: pane header plus path bar.
-const GUTTER_TOP_PAD: f32 = 72.0;
 /// Rows visible in the drawer before it scrolls.
 const DRAWER_VISIBLE_ROWS: f32 = 3.0;
 /// Pitch of one drawer row.
@@ -39,7 +38,10 @@ pub(super) struct TransferState {
     pub label: String,
     /// Display target: "host:dir" or a local directory with `~`.
     pub dest: String,
+    /// Drawn with an up arrow: the worker is the destination side.
     pub upload: bool,
+    /// How the finished transfer is described.
+    pub verb: Verb,
     pub bytes_done: u64,
     pub bytes_total: u64,
     pub file_index: usize,
@@ -70,6 +72,7 @@ pub(super) struct NewTransfer {
     pub label: String,
     pub dest: String,
     pub upload: bool,
+    pub verb: Verb,
     pub retry: Option<RetryRequest>,
 }
 
@@ -81,6 +84,7 @@ impl TransferState {
             label: spec.label,
             dest: spec.dest,
             upload: spec.upload,
+            verb: spec.verb,
             bytes_done: 0,
             bytes_total: 0,
             file_index: 0,
@@ -114,12 +118,12 @@ pub(super) struct PhaseCounts {
     pub active: usize,
 }
 
-/// The direction a finished transfer is described with in toasts.
+/// The direction a transfer is described with in menus, tooltips and toasts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Verb {
     Upload,
     Download,
-    /// Remote → remote, staged through a temp dir.
+    /// Between two remotes (staged through a temp dir) or two local panes.
     Copy,
 }
 
@@ -132,7 +136,7 @@ impl Verb {
         }
     }
 
-    fn noun(self) -> &'static str {
+    pub(super) fn noun(self) -> &'static str {
         match self {
             Verb::Upload => "Upload",
             Verb::Download => "Download",
@@ -145,7 +149,9 @@ impl Verb {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Finished {
     pub label: String,
-    pub upload: bool,
+    pub verb: Verb,
+    /// The pane the files went into.
+    pub dest: Side,
     pub bytes_total: u64,
     pub elapsed: f64,
     /// `None` on success.
@@ -155,6 +161,15 @@ pub(super) struct Finished {
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+/// The verb for moving files from a pane in `src_remote` mode to one in `dest_remote` mode.
+pub(super) fn transfer_verb(src_remote: bool, dest_remote: bool) -> Verb {
+    match (src_remote, dest_remote) {
+        (true, false) => Verb::Download,
+        (false, true) => Verb::Upload,
+        _ => Verb::Copy,
+    }
+}
 
 /// Row label for a request: the base name of a single path, else "N items".
 pub(super) fn transfer_label(paths: &[String]) -> String {
@@ -301,7 +316,7 @@ pub(super) fn summary_parts(counts: PhaseCounts) -> Vec<(String, bool)> {
 
 /// Whether a worker error context belongs to a transfer rather than a listing or file op.
 pub(super) fn is_transfer_context(context: &str) -> bool {
-    matches!(context, "download" | "upload")
+    matches!(context, "download" | "upload" | "copy")
 }
 
 /// The remembered worker error, if it is recent enough to explain a failure now.
@@ -316,9 +331,13 @@ pub(super) fn retry_allowed(req_hosts: [Option<Uuid>; 2], current: [Option<Uuid>
 }
 
 /// Toast text for a finished transfer: `(message, detail)`.
-pub(super) fn result_toast(verb: Verb, done: &Finished) -> (String, Option<String>) {
+pub(super) fn result_toast(done: &Finished) -> (String, Option<String>) {
     if let Some(error) = &done.error {
-        let msg = format!("{} failed: {}", verb.noun(), widgets::short_error(error));
+        let msg = format!(
+            "{} failed: {}",
+            done.verb.noun(),
+            widgets::short_error(error)
+        );
         return (msg, None);
     }
     let time = format!("{:.1} s", done.elapsed);
@@ -327,7 +346,7 @@ pub(super) fn result_toast(verb: Verb, done: &Finished) -> (String, Option<Strin
     } else {
         time
     };
-    (format!("{} {}", verb.past(), done.label), Some(detail))
+    (format!("{} {}", done.verb.past(), done.label), Some(detail))
 }
 
 // ---------------------------------------------------------------------------
@@ -414,23 +433,25 @@ impl FerropipeApp {
             (true, false) => self.start_download(ctx, payload, dest),
             (false, true) => self.start_upload(ctx, payload, dest),
             (true, true) => self.start_staged(ctx, payload, dest),
-            (false, false) => { /* local → local: not supported here */ }
+            (false, false) => self.start_local_copy(ctx, payload, dest),
         }
     }
 
-    /// Row description for a request into `dest`'s current directory.
-    fn transfer_spec(
+    /// Row description for a request into `dest`'s current directory, run by
+    /// `worker` (the destination side counts as an upload).
+    pub(super) fn transfer_spec(
         &self,
         payload: &DragPayload,
         dest: Side,
         worker: Side,
-        upload: bool,
+        verb: Verb,
     ) -> NewTransfer {
         NewTransfer {
             worker,
             label: transfer_label(&payload.paths),
             dest: self.side_dest_label(dest, &self.side_pane(dest).cwd),
-            upload,
+            upload: worker == dest,
+            verb,
             retry: Some(RetryRequest {
                 payload: payload.clone(),
                 dest,
@@ -447,7 +468,7 @@ impl FerropipeApp {
     /// remote → local: the source worker downloads into the destination pane's directory.
     fn start_download(&mut self, ctx: &egui::Context, payload: DragPayload, dest: Side) {
         let local_dir = PathBuf::from(&self.side_pane(dest).cwd);
-        let spec = self.transfer_spec(&payload, dest, payload.side, false);
+        let spec = self.transfer_spec(&payload, dest, payload.side, Verb::Download);
         let id = self.push_transfer(ctx, spec);
         let cmd = Command::Download {
             id,
@@ -460,7 +481,7 @@ impl FerropipeApp {
     /// local → remote: the destination worker uploads into its pane's directory.
     fn start_upload(&mut self, ctx: &egui::Context, payload: DragPayload, dest: Side) {
         let remote_dir = self.side_pane(dest).cwd.clone();
-        let spec = self.transfer_spec(&payload, dest, dest, true);
+        let spec = self.transfer_spec(&payload, dest, dest, Verb::Upload);
         let id = self.push_transfer(ctx, spec);
         let local = payload.paths.iter().map(PathBuf::from).collect();
         self.side_send(
@@ -484,7 +505,7 @@ impl FerropipeApp {
             self.toast(ctx, format!("stage: {e:#}"), true);
             return;
         }
-        let spec = self.transfer_spec(&payload, dest, payload.side, false);
+        let spec = self.transfer_spec(&payload, dest, payload.side, Verb::Copy);
         let job = StageJob {
             temp_dir: temp_dir.clone(),
             names: payload.paths.iter().map(|p| base_name(p)).collect(),
@@ -523,7 +544,7 @@ impl FerropipeApp {
             self.finish_stage_download(ctx, job, done);
         } else if let Some(temp) = self.stage_cleanup.remove(&id) {
             let _ = std::fs::remove_dir_all(&temp);
-            self.toast_result(ctx, Verb::Copy, &done);
+            self.toast_result(ctx, &done);
         } else {
             self.finish_plain(ctx, done);
         }
@@ -536,9 +557,12 @@ impl FerropipeApp {
         t.error = error.is_some();
         t.error_msg = error.clone();
         t.finished_at = Some(now);
+        // The worker is the destination for uploads and the source otherwise.
+        let dest = if t.upload { t.worker } else { t.worker.other() };
         Some(Finished {
             label: t.label.clone(),
-            upload: t.upload,
+            verb: t.verb,
+            dest,
             bytes_total: t.bytes_total,
             elapsed: now - t.started_at,
             error,
@@ -549,7 +573,7 @@ impl FerropipeApp {
     fn finish_stage_download(&mut self, ctx: &egui::Context, job: StageJob, done: Finished) {
         if done.error.is_some() {
             let _ = std::fs::remove_dir_all(&job.temp_dir);
-            self.toast_result(ctx, Verb::Copy, &done);
+            self.toast_result(ctx, &done);
             return;
         }
         let spec = NewTransfer {
@@ -557,6 +581,7 @@ impl FerropipeApp {
             label: job.label,
             dest: job.dest_label,
             upload: true,
+            verb: Verb::Copy,
             retry: None,
         };
         let id = self.push_transfer(ctx, spec);
@@ -570,112 +595,20 @@ impl FerropipeApp {
         self.stage_cleanup.insert(id, job.temp_dir);
     }
 
-    /// A plain upload or download ended: relist a local destination and report.
+    /// An unstaged transfer ended: relist a local destination and report.
+    /// (A remote destination is relisted by its worker's `OpDone`.)
     fn finish_plain(&mut self, ctx: &egui::Context, done: Finished) {
-        if done.error.is_none() && !done.upload && !self.left_remote {
-            reload_local(&mut self.local, self.store.settings.show_hidden);
+        if done.error.is_none() {
+            self.relist_local_dest(done.dest);
         }
-        let verb = if done.upload {
-            Verb::Upload
-        } else {
-            Verb::Download
-        };
-        self.toast_result(ctx, verb, &done);
+        self.toast_result(ctx, &done);
     }
 
     /// Toast the outcome and leave it in the status bar once the toast is gone.
-    fn toast_result(&mut self, ctx: &egui::Context, verb: Verb, done: &Finished) {
-        let (msg, detail) = result_toast(verb, done);
+    fn toast_result(&mut self, ctx: &egui::Context, done: &Finished) {
+        let (msg, detail) = result_toast(done);
         self.status = msg.clone();
         self.toast_detail(ctx, msg, detail, done.error.is_some());
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Gutter
-// ---------------------------------------------------------------------------
-
-impl FerropipeApp {
-    /// The 44px column between the panes: two transfer arrows and a queue count.
-    pub(super) fn render_gutter(&mut self, ctx: &egui::Context, ui: &mut Ui) {
-        let p = theme::current(ui);
-        egui::Panel::left("gutter")
-            .exact_size(GUTTER_W)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::new().fill(p.bg1))
-            .show(ui, |ui| {
-                let rect = ui.max_rect();
-                let line = Stroke::new(1.0, p.line);
-                ui.painter().vline(rect.left() + 0.5, rect.y_range(), line);
-                ui.painter().vline(rect.right() - 0.5, rect.y_range(), line);
-                ui.vertical_centered(|ui| {
-                    ui.add_space(GUTTER_TOP_PAD);
-                    self.gutter_arrows(ctx, ui);
-                    self.gutter_queue_note(ui);
-                });
-            });
-    }
-
-    /// "→" sends the left pane's selection right; "←" the right pane's left.
-    fn gutter_arrows(&mut self, ctx: &egui::Context, ui: &mut Ui) {
-        let right_on = self.arrow_enabled(Side::Left);
-        let left_on = self.arrow_enabled(Side::Right);
-        let (tip_right, tip_left) = if self.left_remote {
-            (
-                "Copy selected to the right pane",
-                "Copy selected to the left pane",
-            )
-        } else {
-            ("Upload selected", "Download selected")
-        };
-        let right = widgets::gutter_arrow(ui, "→", right_on, right_on).on_hover_text(tip_right);
-        if right.clicked() {
-            let payload = self.selection_payload(Side::Left);
-            self.start_transfer(ctx, payload, Side::Right);
-        }
-        ui.add_space(6.0);
-        let left_primary = left_on && !right_on;
-        let left = widgets::gutter_arrow(ui, "←", left_on, left_primary).on_hover_text(tip_left);
-        if left.clicked() {
-            let payload = self.selection_payload(Side::Right);
-            self.start_transfer(ctx, payload, Side::Left);
-        }
-    }
-
-    /// The arrow out of `src` is usable when it has a selection and both ends are reachable.
-    fn arrow_enabled(&self, src: Side) -> bool {
-        !self.side_pane(src).selected.is_empty()
-            && self.side_usable(src)
-            && self.side_usable(src.other())
-    }
-
-    /// The current selection of `src` as a drop payload.
-    fn selection_payload(&self, src: Side) -> DragPayload {
-        DragPayload {
-            side: src,
-            remote: self.side_is_remote(src),
-            paths: self.side_pane(src).selected_paths(),
-        }
-    }
-
-    /// "running / active" under the arrows plus a hairline down to the bottom.
-    fn gutter_queue_note(&self, ui: &mut Ui) {
-        let counts = count_phases(&phases_of(&self.transfers));
-        if counts.active == 0 {
-            return;
-        }
-        let p = theme::current(ui);
-        ui.add_space(10.0);
-        let text = RichText::new(format!("{} / {}", counts.running, counts.active))
-            .font(FontId::new(10.5, FontFamily::Monospace))
-            .color(p.text3);
-        ui.add(Label::new(text).selectable(false));
-        let rect = ui.max_rect();
-        let top = ui.cursor().top() + 4.0;
-        let range = Rangef::new(top, rect.bottom());
-        ui.painter()
-            .vline(rect.center().x, range, Stroke::new(1.0, p.line));
     }
 }
 

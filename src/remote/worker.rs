@@ -2,7 +2,7 @@
 //! generic command loop against it.
 
 use super::sftp::{self, SftpFs};
-use super::{Command, Event, serve, smb, winrm};
+use super::{Command, Event, copy_local_command, serve, smb, winrm};
 use crate::model::ConnectionKind;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
@@ -53,6 +53,12 @@ fn worker_main(rx: Receiver<Command>, tx: Sender<Event>, repaint: impl Fn()) {
                     break;
                 }
             }
+            // A local pane's worker sits here, unconnected; copies need no session.
+            Ok(Command::CopyLocal {
+                id,
+                paths,
+                dest_dir,
+            }) => copy_local_command(id, &paths, &dest_dir, &emit),
             Ok(Command::Shutdown) | Err(_) => break,
             Ok(_) => { /* ignore ops while disconnected */ }
         }

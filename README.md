@@ -28,13 +28,15 @@ RDP — with a **dual-pane file browser**, drag-and-drop transfer (including
 - Auth: password, private-key file (+ passphrase), or ssh-agent.
 
 ### Files
-- **Dual-pane browser** — local ⟷ remote, resizable splitter, sortable columns,
+- **Dual-pane browser** — either pane shows *this computer* or a host (pick from the
+  pane's host pill, or drag a host onto it), resizable splitter, sortable columns,
   multi-select, breadcrumb/editable path bar, up/home/refresh, hidden-file toggle.
-- **Drag-and-drop transfer** between panes, recursive directories, live progress queue,
-  atomic writes (`.part` + rename), success/failure reporting.
-- **Remote-to-remote transfer** — point the left pane at a *second* remote host (the
-  "Source" picker) and transfer between two servers. (Bytes stage through the local machine
-  — true server-to-server isn't possible over SFTP/SMB/WinRM; every client relays.)
+- **Drag-and-drop transfer** between panes in any combination — local ⟷ remote,
+  remote ⟷ remote, and local → local copies on this machine — recursive directories,
+  live progress queue, atomic writes (`.part` + rename), success/failure reporting.
+- **Remote-to-remote transfer** — point both panes at hosts and transfer between two
+  servers. (Bytes stage through the local machine — true server-to-server isn't possible
+  over SFTP/SMB/WinRM; every client relays.)
 - **File ops** on both sides — new folder, new file, rename, delete (with confirm).
 - **Live remote edit** — right-click → *Edit (live)*: downloads the file, opens it in your
   editor, and auto-re-uploads every time you save.

@@ -11,6 +11,7 @@ use egui::{
 use egui_extras::{Column, TableBuilder, TableRow};
 use std::any::Any;
 use std::sync::Arc;
+use transfers::{Verb, transfer_verb};
 
 /// Width of the host popup under a pane header.
 const HOST_POPUP_W: f32 = 260.0;
@@ -49,6 +50,14 @@ struct RowEvents {
 /// the same popup programmatically, so both agree on an explicit id.
 fn host_popup_id(side: Side) -> Id {
     Id::new(("ferropipe.host_popup", side as u8))
+}
+
+/// The row menu's transfer entry: the verb with an arrow toward the other pane.
+fn transfer_menu_label(side: Side, verb: Verb) -> String {
+    match side {
+        Side::Left => format!("{} ▶", verb.noun()),
+        Side::Right => format!("◀ {}", verb.noun()),
+    }
 }
 
 /// The line under a pane header: a 2 px accent for the focused pane, the
@@ -129,9 +138,8 @@ impl FerropipeApp {
         let resp =
             widgets::host_selector(ui, ("hostsel", side as u8), &name, sub.as_deref(), status);
         match self.host_popup(&resp, side) {
-            Some(HostChoice::Local) => self.left_to_local(),
-            Some(HostChoice::Host(id)) if side == Side::Left => self.connect_left(ctx, id),
-            Some(HostChoice::Host(id)) => self.connect(ctx, id),
+            Some(HostChoice::Local) => self.side_to_local(side),
+            Some(HostChoice::Host(id)) => self.connect_side(ctx, side, id),
             Some(HostChoice::Disconnect) => self.disconnect(),
             None => {}
         }
@@ -139,8 +147,10 @@ impl FerropipeApp {
 
     /// Name, subtitle and status for a pane's host pill.
     fn pane_host(&self, side: Side) -> (String, Option<String>, HostStatus) {
+        if !self.side_is_remote(side) {
+            return ("This computer".into(), None, HostStatus::Idle);
+        }
         match side {
-            Side::Left if !self.left_remote => ("This computer".into(), None, HostStatus::Idle),
             Side::Left => {
                 let status = if self.lconnected.is_some() {
                     HostStatus::Connected
@@ -172,21 +182,19 @@ impl FerropipeApp {
         }
     }
 
-    /// Popup under the host pill listing every file-capable host plus, per side,
-    /// "This computer" or "Disconnect". Returns what was clicked.
+    /// Popup under the host pill: "This computer", every file-capable host
+    /// and, on a connected right pane, "Disconnect". Returns what was clicked.
     fn host_popup(&self, resp: &Response, side: Side) -> Option<HostChoice> {
         let mut choice = None;
         Popup::menu(resp)
             .id(host_popup_id(side))
             .width(HOST_POPUP_W)
             .show(|ui| {
-                if side == Side::Left {
-                    if ui.button("⌂ This computer").clicked() {
-                        choice = Some(HostChoice::Local);
-                        ui.close();
-                    }
-                    ui.separator();
+                if ui.button("⌂ This computer").clicked() {
+                    choice = Some(HostChoice::Local);
+                    ui.close();
                 }
+                ui.separator();
                 for c in self
                     .store
                     .connections
@@ -207,14 +215,6 @@ impl FerropipeApp {
                 }
             });
         choice
-    }
-
-    /// Put the left pane back on the local filesystem, dropping its remote session.
-    fn left_to_local(&mut self) {
-        if self.left_remote || self.lconnecting {
-            self.lworker.send(Command::Disconnect);
-            self.revert_left_to_local(); // revert immediately, don't wait for the event
-        }
     }
 
     /// Path bar plus listing, or the empty / connecting placeholder for a
@@ -257,11 +257,14 @@ impl FerropipeApp {
             }
             PaneView::Connecting(name) => connecting_note(ui, &name),
             PaneView::Listing => {
+                let verb =
+                    transfer_verb(self.side_is_remote(side), self.side_is_remote(side.other()));
+                let menu_label = transfer_menu_label(side, verb);
                 let pane = self.side_pane_mut(side);
                 if let Some(action) = path_bar_row(ui, pane, side) {
                     out.push(path_outcome(action));
                 }
-                out.extend(render_listing(ui, pane, side));
+                out.extend(render_listing(ui, pane, side, &menu_label));
             }
         }
     }
@@ -276,7 +279,7 @@ impl FerropipeApp {
                 self.lpending,
             ),
             Side::Right => (
-                true,
+                !self.right_local,
                 self.connected.is_some(),
                 self.connecting,
                 self.pending_connect,
@@ -376,7 +379,13 @@ fn path_outcome(action: PathAction) -> PaneOutcome {
 
 /// Loading / error notes, then the table inside a drop zone. A drag from the
 /// other pane gets a dashed accent outline while it hovers here.
-fn render_listing(ui: &mut Ui, pane: &mut PaneState, side: Side) -> Vec<PaneOutcome> {
+/// `menu_label` names the row menu's transfer entry.
+fn render_listing(
+    ui: &mut Ui,
+    pane: &mut PaneState,
+    side: Side,
+    menu_label: &str,
+) -> Vec<PaneOutcome> {
     let p = theme::current(ui);
     let mut out = Vec::new();
     Frame::new()
@@ -397,7 +406,7 @@ fn render_listing(ui: &mut Ui, pane: &mut PaneState, side: Side) -> Vec<PaneOutc
                 ui.colored_label(p.err, err);
             }
             let (zone, dropped) = drop_zone::<DragPayload, _>(ui, Frame::NONE.fill(p.bg0), |ui| {
-                out.extend(render_table(ui, pane, side));
+                out.extend(render_table(ui, pane, side, menu_label));
             });
             if let Some(payload) = dropped {
                 out.push(PaneOutcome::Drop((*payload).clone()));
@@ -455,7 +464,12 @@ fn host_drop_hint(ui: &Ui, rect: Rect, name: &str) {
 }
 
 /// Column headers plus one row per entry; only the rows in view are laid out.
-fn render_table(ui: &mut Ui, pane: &mut PaneState, side: Side) -> Vec<PaneOutcome> {
+fn render_table(
+    ui: &mut Ui,
+    pane: &mut PaneState,
+    side: Side,
+    menu_label: &str,
+) -> Vec<PaneOutcome> {
     let ctrl = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
     let mut clicked_sort: Option<SortCol> = None;
     let mut ev = RowEvents::default();
@@ -473,7 +487,7 @@ fn render_table(ui: &mut Ui, pane: &mut PaneState, side: Side) -> Vec<PaneOutcom
         .header(HEADER_H, |header| clicked_sort = table_header(header, view))
         .body(|body| {
             body.rows(ROW_H, view.entries.len(), |row| {
-                table_row(row, view, side, ctrl, &mut ev);
+                table_row(row, view, side, ctrl, menu_label, &mut ev);
             });
         });
     // Apply the deferred changes now that the immutable borrow is released.
@@ -519,6 +533,7 @@ fn table_row(
     pane: &PaneState,
     side: Side,
     ctrl: bool,
+    menu_label: &str,
     ev: &mut RowEvents,
 ) {
     let entry = &pane.entries[row.index()];
@@ -542,7 +557,7 @@ fn table_row(
     if resp.double_clicked() && entry.is_dir {
         ev.out.push(PaneOutcome::Enter(pane.full_path(&entry.name)));
     }
-    resp.context_menu(|ui| row_menu(ui, pane, entry, is_sel, ev));
+    resp.context_menu(|ui| row_menu(ui, pane, entry, is_sel, menu_label, ev));
 }
 
 /// Glyph + name, wrapped in a drag source carrying the selection (or just this entry).
@@ -568,20 +583,22 @@ fn name_cell(ui: &mut Ui, pane: &PaneState, side: Side, entry: &FileEntry, is_se
     });
 }
 
-/// Row context menu: Open, transfer, live edit, Rename, Delete.
-fn row_menu(ui: &mut Ui, pane: &PaneState, entry: &FileEntry, is_sel: bool, ev: &mut RowEvents) {
+/// Row context menu: Open, transfer (`menu_label`), live edit, Rename, Delete.
+fn row_menu(
+    ui: &mut Ui,
+    pane: &PaneState,
+    entry: &FileEntry,
+    is_sel: bool,
+    menu_label: &str,
+    ev: &mut RowEvents,
+) {
     let p = theme::current(ui);
     let name = &entry.name;
     if entry.is_dir && ui.button("Open").clicked() {
         ev.out.push(PaneOutcome::Enter(pane.full_path(name)));
         ui.close();
     }
-    let tlabel = if pane.remote {
-        "◀ Download"
-    } else {
-        "Upload ▶"
-    };
-    if ui.button(tlabel).clicked() {
+    if ui.button(menu_label).clicked() {
         if !is_sel {
             ev.click = Some((name.clone(), false));
         }
@@ -675,89 +692,4 @@ fn entry_label(entry: &FileEntry, p: &theme::Palette) -> (RichText, RichText) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn pane() -> PaneState {
-        PaneState::new(true, "/srv".into())
-    }
-
-    // -- header_rule -------------------------------------------------------
-
-    #[test]
-    fn header_rule_is_a_two_pixel_accent_line_for_the_focused_pane() {
-        // Arrange
-        let p = &theme::DARK;
-        // Act
-        let rule = header_rule(true, p);
-        // Assert
-        assert_eq!(rule.width, 2.0);
-        assert_eq!(rule.color, p.accent);
-    }
-
-    #[test]
-    fn header_rule_is_a_one_pixel_hairline_for_the_other_pane() {
-        let p = &theme::LIGHT;
-        let rule = header_rule(false, p);
-        assert_eq!(rule.width, 1.0);
-        assert_eq!(rule.color, p.line);
-    }
-
-    fn selected(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|n| n.to_string()).collect()
-    }
-
-    // -- apply_click -------------------------------------------------------
-
-    #[test]
-    fn apply_click_plain_click_replaces_the_selection() {
-        // Arrange
-        let mut pane = pane();
-        pane.selected = selected(&["a", "b"]);
-        // Act
-        apply_click(&mut pane, "c".into(), false);
-        // Assert
-        assert_eq!(pane.selected, selected(&["c"]));
-    }
-
-    #[test]
-    fn apply_click_ctrl_click_adds_an_unselected_entry() {
-        let mut pane = pane();
-        pane.selected = selected(&["a"]);
-        apply_click(&mut pane, "b".into(), true);
-        assert_eq!(pane.selected, selected(&["a", "b"]));
-    }
-
-    #[test]
-    fn apply_click_ctrl_click_removes_an_already_selected_entry() {
-        let mut pane = pane();
-        pane.selected = selected(&["a", "b"]);
-        apply_click(&mut pane, "a".into(), true);
-        assert_eq!(pane.selected, selected(&["b"]));
-    }
-
-    // -- apply_sort --------------------------------------------------------
-
-    #[test]
-    fn apply_sort_same_column_flips_the_direction() {
-        // Arrange: a fresh pane sorts by name, ascending.
-        let mut pane = pane();
-        // Act
-        apply_sort(&mut pane, SortCol::Name);
-        // Assert
-        assert_eq!(pane.sort_col, SortCol::Name);
-        assert!(!pane.sort_asc);
-        apply_sort(&mut pane, SortCol::Name);
-        assert!(pane.sort_asc);
-    }
-
-    #[test]
-    fn apply_sort_new_column_resets_to_ascending() {
-        let mut pane = pane();
-        pane.sort_col = SortCol::Modified;
-        pane.sort_asc = false;
-        apply_sort(&mut pane, SortCol::Size);
-        assert_eq!(pane.sort_col, SortCol::Size);
-        assert!(pane.sort_asc);
-    }
-}
+mod tests;

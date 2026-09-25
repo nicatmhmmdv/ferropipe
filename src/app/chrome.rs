@@ -31,25 +31,27 @@ pub(super) fn minutes_since(since: f64, now: f64) -> u64 {
     ((now - since).max(0.0) / 60.0).floor() as u64
 }
 
-/// The left half of the status bar as `(accent, muted)` text: the connected
-/// host in the success color, then protocol / uptime / left-pane host muted.
+/// The left half of the status bar as `(accent, muted)` text: the right
+/// pane's host in the success color, then protocol / uptime / left-pane host
+/// muted. With only the left pane on a host, that host takes the accent;
+/// with neither, a muted placeholder.
 pub(super) fn session_summary(
     host: Option<&str>,
     kind: &str,
     minutes: u64,
     left: Option<(&str, &str)>,
 ) -> (String, String) {
-    let (accent, mut muted) = match host {
-        Some(host) => (
-            format!("● {host}"),
-            format!(" · {kind} · connected {minutes} min"),
-        ),
-        None => (String::new(), "No remote host".to_string()),
-    };
-    if let Some((name, kind)) = left {
-        muted.push_str(&format!(" · left: {name} ({kind})"));
+    match (host, left) {
+        (Some(host), left) => {
+            let mut muted = format!(" · {kind} · connected {minutes} min");
+            if let Some((name, kind)) = left {
+                muted.push_str(&format!(" · left: {name} ({kind})"));
+            }
+            (format!("● {host}"), muted)
+        }
+        (None, Some((name, kind))) => (format!("● {name}"), format!(" · {kind} · left pane")),
+        (None, None) => (String::new(), "No remote host".to_string()),
     }
-    (accent, muted)
 }
 
 /// 11px monospace text in `color`.
@@ -215,18 +217,8 @@ impl FerropipeApp {
     /// relisting a remote pane just keeps both sides consistent.
     fn set_show_hidden(&mut self, hidden: bool) {
         self.store.settings.show_hidden = hidden;
-        if !self.left_remote {
-            reload_local(&mut self.local, hidden);
-        } else if self.lconnected.is_some() {
-            self.lworker.send(Command::ListRemote {
-                path: self.local.cwd.clone(),
-            });
-        }
-        if self.connected.is_some() {
-            self.worker.send(Command::ListRemote {
-                path: self.remote.cwd.clone(),
-            });
-        }
+        self.refresh_pane(Side::Left);
+        self.refresh_pane(Side::Right);
         self.save_store();
     }
 }
@@ -263,10 +255,19 @@ mod tests {
     }
 
     #[test]
-    fn session_summary_appends_the_left_pane_host() {
+    fn session_summary_appends_the_left_pane_host_after_the_right_one() {
         let (_, muted) = session_summary(Some("web01"), "SFTP", 0, Some(("nas", "SMB")));
         assert_eq!(muted, " · SFTP · connected 0 min · left: nas (SMB)");
-        let (_, muted) = session_summary(None, "", 0, Some(("nas", "SMB")));
-        assert_eq!(muted, "No remote host · left: nas (SMB)");
+    }
+
+    #[test]
+    fn session_summary_names_the_left_pane_host_when_it_is_the_only_one() {
+        // Arrange: the right pane shows this computer, the left a host.
+        let left = Some(("nas", "SMB"));
+        // Act
+        let (accent, muted) = session_summary(None, "", 0, left);
+        // Assert
+        assert_eq!(accent, "● nas");
+        assert_eq!(muted, " · SMB · left pane");
     }
 }

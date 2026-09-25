@@ -68,7 +68,7 @@ impl FerropipeApp {
     }
 
     /// Relist the pane's current directory.
-    fn refresh_pane(&mut self, side: Side) {
+    pub(super) fn refresh_pane(&mut self, side: Side) {
         if !self.side_is_remote(side) {
             let show_hidden = self.store.settings.show_hidden;
             reload_local(self.side_pane_mut(side), show_hidden);
@@ -157,10 +157,9 @@ impl FerropipeApp {
         if already_open {
             return;
         }
-        match (host_drop_action(kind), side) {
-            (HostDrop::Reject(msg), _) => self.toast(ctx, msg, true),
-            (HostDrop::Browse, Side::Left) => self.connect_left(ctx, id),
-            (HostDrop::Browse, Side::Right) => self.connect(ctx, id),
+        match host_drop_action(kind) {
+            HostDrop::Reject(msg) => self.toast(ctx, msg, true),
+            HostDrop::Browse => self.connect_side(ctx, side, id),
         }
     }
 }

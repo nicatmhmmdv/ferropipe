@@ -86,6 +86,7 @@ impl FerropipeApp {
                 label: name.clone(),
                 dest: self.side_dest_label(side, &dir),
                 upload: true,
+                verb: transfers::Verb::Upload,
                 retry: None,
             };
             let id = self.push_transfer(ctx, spec);
