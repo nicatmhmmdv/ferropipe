@@ -262,7 +262,12 @@ impl NativeSession {
                 return;
             }
             StripAction::SecureAttention => {
-                self.send(encode(keymap::secure_attention_sequence()).collect())
+                // Release whatever the bridge believes is held first, so the
+                // server's modifier state matches ours after the sequence's
+                // own releases (the user may be holding Ctrl while clicking).
+                let mut batch: Vec<Outgoing> = encode(self.keyboard.release_all()).collect();
+                batch.extend(encode(keymap::secure_attention_sequence()));
+                self.send(batch);
             }
             StripAction::None => {}
         }
