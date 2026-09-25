@@ -5,7 +5,9 @@ RDP — with a **dual-pane file browser**, drag-and-drop transfer (including
 **remote-to-remote**), an embedded command console, and live remote-file editing. Built on
 [`egui`](https://github.com/emilk/egui). An XPipe/Termius-style client, in one static binary.
 
-![Ferropipe](docs/screenshot.png)
+![Ferropipe, dark theme](docs/screenshot.png)
+
+![Ferropipe, light theme](docs/screenshot-light.png)
 
 ## Features
 
@@ -18,7 +20,9 @@ RDP — with a **dual-pane file browser**, drag-and-drop transfer (including
     built-in file transfer) and run commands. Strict TLS by default; per-connection
     "accept invalid cert" opt-in for self-signed :5986.
   - **RDP** — launched via **Remmina** with a tuned profile (GFX AVC444 codec + network
-    autodetect for a responsive session).
+    autodetect for a responsive session). The experimental **native client** (`RDP (Native)`)
+    now has a real keyboard: physical-key scancodes (modifiers, arrows, F-keys, AltGr on
+    non-US layouts) plus a Ctrl+Alt+Del button in the window strip.
 - Nested **groups** (`WIM/Tovuz`, `Shusha Paid Route/27 KM`), search, add/edit/duplicate/delete.
 - **Import** hosts from `~/.ssh/config`.
 - Auth: password, private-key file (+ passphrase), or ssh-agent.
@@ -49,8 +53,16 @@ RDP — with a **dual-pane file browser**, drag-and-drop transfer (including
   (reviewed for injection); temp files are private (`tempfile`, `0600`, auto-removed).
 
 ### UX
-- Dark/light theme, orange accent, responsive (all I/O on background worker threads).
-- Two concurrent sessions (one per pane) so nothing blocks.
+- **Foundry look** — a warm dark theme and a paper light theme, one rust accent reserved
+  for actions, host rows with protocol chips and an optional tag-color stripe, a transfer
+  gutter between the panes and a transfer drawer with per-row progress, retry and dismiss.
+- **Drag a host onto a pane** to open it there (either pane; RDP hosts open in their own
+  window instead), or pick one from the pane's host pill.
+- Responsive: all I/O on background worker threads, two concurrent sessions (one per
+  pane) so nothing blocks.
+- **Function keys**, Commander style — F2 Rename · F4 Edit · F5 Copy · F7 Mkdir ·
+  F8 Delete · F9 Console · F10 Hosts · Tab switches pane. They act on the focused pane
+  (click a pane to focus it); the legend bar is toggled with "Keys" in the top bar.
 
 ## Build & run
 
@@ -60,6 +72,10 @@ and — for RDP — `remmina` + `freerdp`.
 ```bash
 cargo run --release
 ```
+
+Fonts are discovered at runtime (IBM Plex, then Noto Sans / Cantarell / JetBrains Mono,
+then DejaVu). To embed IBM Plex in the binary instead, drop the four files listed in
+`assets/fonts/README.md` into `assets/fonts/` and build with `--features bundled-fonts`.
 
 ## Configuration
 
@@ -74,7 +90,28 @@ All options live in the GUI; you should never hand-edit these.
 
 ```
 main.rs        → load store + vault, launch eframe
-app.rs         → egui UI: sidebar, dual panes, console, dialogs, transfer queue, 2 sessions
+theme.rs       → Foundry palette tokens and the egui Visuals/Style pass
+  fonts.rs     → runtime font discovery (optional `bundled-fonts` embedding)
+widgets/       → state-free Foundry widgets
+  host.rs      → status dot, protocol chip, tag stripe, host pill
+  path.rs      → breadcrumb path bar
+  transfer.rs  → transfer row, gutter arrows
+  fkeys.rs     → Commander function-key bar and its key mapping
+  misc.rs      → primary button, toast, empty pane, icon button
+app.rs         → FerropipeApp: state, worker plumbing, frame loop
+  session.rs   → connect / disconnect, worker events, navigation
+  sidebar.rs   → hosts sidebar: filter, grouped rows, host menu, host drag
+  panes.rs     → file panes: host pill, path bar, listing table, drop targets
+  pane_actions.rs → dispatch of pane outcomes (open, transfer, rename, …)
+  editor.rs    → add / edit connection form
+  transfers.rs → transfer gutter, drawer and bookkeeping (queue, retry, staging)
+  fkeys.rs     → function-key handling and the legend bar
+  console.rs   → command console
+  live_edit.rs → edit-remote-file watcher
+  dialogs.rs   → prompts and delete confirmation
+  ssh_panel.rs → Windows remote-access panel (enable SSH/WinRM, transfer)
+  chrome.rs    → top bar, status bar and toasts
+native_rdp.rs  → in-app RDP window: framebuffer texture, keyboard bridge, mouse
 remote/        → backend-agnostic worker
   mod.rs       → RemoteFs trait + generic transfer/walk/delete + command loop
   sftp.rs      → SSH connect + host-key verify + SFTP + exec
@@ -104,7 +141,8 @@ ssh-config parsing.
 - **Tiling WMs** (Hyprland/sway) size the window themselves; float it with
   `hyprctl keyword windowrulev2 'float,class:^(Ferropipe)$'`.
 - Roadmap: streaming remote-to-remote (through memory, no temp file), SSH port-forward
-  tunnels, chmod/permissions dialog, a pure-Rust SSH transport (`russh`).
+  tunnels, chmod/permissions dialog, a pure-Rust SSH transport (`russh`), and a tabbed
+  **Sessions** layout (plan in [docs/sessions-plan.md](docs/sessions-plan.md)).
 
 ## License
 
