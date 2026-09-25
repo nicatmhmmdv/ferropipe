@@ -3,19 +3,150 @@
 //! thread and publishes framebuffer snapshots; the UI draws them in a floating
 //! window and forwards mouse/keyboard as fast-path input.
 //!
+//! Keyboard: every `egui::Event::Key` goes out as a scan code for the *physical*
+//! key (`ferropipe_rdp::keymap::egui`), so modifiers, arrows, F-keys, Escape,
+//! Tab and friends reach the server and non-US layouts work (the server applies
+//! its own layout). `Event::Text` is sent as a Unicode event only when no scan
+//! code already carried it (a key `KeyCode` cannot express, or an IME commit).
+//! A strip above the desktop carries the host name, a Ctrl+Alt+Del button and
+//! Disconnect.
+//!
 //! The session advertises multitransport, so where the server and the transport
 //! stack support it the graphics ride UDP (via the sibling `rdpeudp` crate);
 //! otherwise it stays on the reliable TCP path.
 
 use eframe::egui;
-use ferropipe_rdp::input::{mouse_event, unicode_event, PTRFLAGS_BUTTON1, PTRFLAGS_BUTTON2, PTRFLAGS_DOWN, PTRFLAGS_MOVE};
+use egui::{Align, Button, FontId, Label, Layout, RichText, Sense, Stroke, UiBuilder};
+use ferropipe_rdp::input::{
+    self, PTRFLAGS_BUTTON1, PTRFLAGS_BUTTON2, PTRFLAGS_DOWN, PTRFLAGS_MOVE,
+};
+use ferropipe_rdp::keymap::egui::KeyboardBridge;
+use ferropipe_rdp::keymap::{self, KeyCode, KeyEvent};
 use ferropipe_rdp::session::{RdpSession, SessionParams};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::theme::{self, RADIUS};
+
+/// One encoded fast-path input event (scan code, Unicode or mouse): what the
+/// session thread's channel carries, in batches.
+type Outgoing = Vec<u8>;
 /// A batch of fast-path input event byte-blobs.
-type InputBatch = Vec<Vec<u8>>;
+type InputBatch = Vec<Outgoing>;
+
+/// Keep Tab, arrows and Escape on the desktop instead of letting egui move its
+/// own focus around (otherwise Tab lands on a strip button and Enter clicks it).
+const DESKTOP_EVENT_FILTER: egui::EventFilter = egui::EventFilter {
+    tab: true,
+    horizontal_arrows: true,
+    vertical_arrows: true,
+    escape: true,
+};
+/// Height of the strip above the desktop image.
+const STRIP_H: f32 = 24.0;
+/// Horizontal inset of the strip's contents.
+const STRIP_PAD: f32 = 8.0;
+/// Horizontal padding inside the strip's buttons.
+const STRIP_BUTTON_PAD_X: f32 = 8.0;
+/// Size of the host name in the strip (matches the sidebar's host rows).
+const STRIP_NAME_SIZE: f32 = 13.0;
+
+/// What the user clicked in the top strip this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripAction {
+    None,
+    /// Send Ctrl+Alt+Del.
+    SecureAttention,
+    /// Close the session.
+    Disconnect,
+}
+
+/// Turn one frame's egui keyboard events into fast-path input events, in order.
+///
+/// `modifiers` is the frame's collapsed modifier state (`InputState::modifiers`).
+/// The server's Shift/Ctrl/Alt are brought in line with it first, then each
+/// event is applied: keys go out as scan codes and the bridge keeps modifier
+/// state straight; a `Text` event is sent as Unicode only when the bridge says
+/// no scan code already carried it (`KeyboardBridge::text_wanted`). Pointer
+/// events are not handled here — the mouse is forwarded from the image widget's
+/// response (see [`pointer_event`]).
+fn translate_events(
+    bridge: &mut KeyboardBridge,
+    events: &[egui::Event],
+    modifiers: egui::Modifiers,
+) -> Vec<Outgoing> {
+    let mut out: Vec<Outgoing> = encode(bridge.modifiers_changed(modifiers)).collect();
+    for event in events {
+        match event {
+            egui::Event::Key {
+                key,
+                physical_key,
+                pressed,
+                repeat,
+                modifiers,
+            } => {
+                let events = bridge.key(*key, *physical_key, *pressed, *repeat, *modifiers);
+                out.extend(encode(events));
+            }
+            egui::Event::ModifiersChanged(m) => out.extend(encode(bridge.modifiers_changed(*m))),
+            egui::Event::Text(text) => {
+                if bridge.text_wanted(modifiers) {
+                    out.extend(text_events(text));
+                }
+            }
+            // egui-winit turns Ctrl+C/X/V into these instead of key events. Ctrl
+            // is already down on the server, so tapping the letter completes the
+            // chord there; clipboard redirection is out of scope.
+            egui::Event::Copy => out.extend(tap(KeyCode::C)),
+            egui::Event::Cut => out.extend(tap(KeyCode::X)),
+            egui::Event::Paste(_) => out.extend(tap(KeyCode::V)),
+            // Never leave a modifier stuck down on the server when the window
+            // goes away.
+            egui::Event::WindowFocused(false) => out.extend(encode(bridge.release_all())),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A press and release Unicode event per UTF-16 unit of `text`.
+fn text_events(text: &str) -> impl Iterator<Item = Outgoing> + '_ {
+    text.encode_utf16().flat_map(|unit| {
+        [
+            input::unicode_event(unit, true),
+            input::unicode_event(unit, false),
+        ]
+    })
+}
+
+fn encode(events: Vec<KeyEvent>) -> impl Iterator<Item = Outgoing> {
+    events.into_iter().map(KeyEvent::encode)
+}
+
+/// Press and release one key.
+fn tap(key: KeyCode) -> [Outgoing; 2] {
+    [
+        keymap::key_event(key, true).encode(),
+        keymap::key_event(key, false).encode(),
+    ]
+}
+
+/// The pointer's position and buttons as one mouse event, while it is over the
+/// desktop image. `hover_pos` is `None` anywhere else (the strip, a tooltip),
+/// so clicks on the chrome never reach the remote.
+fn pointer_event(response: &egui::Response) -> Option<Outgoing> {
+    let pos = response.hover_pos()?;
+    let rel = pos - response.rect.min;
+    let (x, y) = (rel.x.max(0.0) as u16, rel.y.max(0.0) as u16);
+    let mut flags = PTRFLAGS_MOVE;
+    if response.dragged_by(egui::PointerButton::Primary) || response.is_pointer_button_down_on() {
+        flags |= PTRFLAGS_DOWN | PTRFLAGS_BUTTON1;
+    } else if response.dragged_by(egui::PointerButton::Secondary) {
+        flags |= PTRFLAGS_DOWN | PTRFLAGS_BUTTON2;
+    }
+    Some(input::mouse_event(flags, x, y))
+}
 
 #[derive(Default)]
 struct FrameState {
@@ -29,6 +160,8 @@ struct FrameState {
 
 struct NativeSession {
     title: String,
+    /// The remote host, shown in the strip above the desktop.
+    host: String,
     /// Identity of the saved connection (dedup key), so re-activating a
     /// connection that's already open doesn't spawn a second window.
     key: String,
@@ -38,6 +171,8 @@ struct NativeSession {
     input_tx: Sender<InputBatch>,
     texture: Option<egui::TextureHandle>,
     last_generation: u64,
+    /// Which modifier keys the server currently has down.
+    keyboard: KeyboardBridge,
     open: bool,
 }
 
@@ -67,8 +202,9 @@ impl NativeRdpManager {
             status: Some(format!("Connecting to {}…", params.host)),
             ..Default::default()
         }));
-        let (input_tx, input_rx): (Sender<InputBatch>, Receiver<InputBatch>) = channel();
+        let (input_tx, input_rx): (Sender<InputBatch>, Receiver<InputBatch>) = mpsc::channel();
 
+        let host = params.host.clone();
         let frame_bg = frame.clone();
         thread::spawn(move || run_session(params, frame_bg, input_rx));
 
@@ -76,12 +212,14 @@ impl NativeRdpManager {
         self.next_vp += 1;
         self.sessions.push(NativeSession {
             title,
+            host,
             key,
             vp,
             frame,
             input_tx,
             texture: None,
             last_generation: 0,
+            keyboard: KeyboardBridge::new(),
             open: true,
         });
     }
@@ -98,14 +236,12 @@ impl NativeRdpManager {
                 .with_title(session.title.clone())
                 .with_inner_size([1280.0, 800.0])
                 .with_maximized(true);
-            let mut keep_open = true;
             ctx.show_viewport_immediate(vid, builder, |ui, _class| {
                 session.render(ui);
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
-                    keep_open = false;
+                    session.open = false;
                 }
             });
-            session.open = keep_open;
         }
         self.sessions.retain(|s| s.open);
         if !self.sessions.is_empty() {
@@ -118,6 +254,43 @@ impl NativeRdpManager {
 
 impl NativeSession {
     fn render(&mut self, ui: &mut egui::Ui) {
+        match self.render_strip(ui) {
+            StripAction::Disconnect => {
+                // Dropping the session (and its sender) makes the protocol
+                // thread tear the connection down, same as closing the window.
+                self.open = false;
+                return;
+            }
+            StripAction::SecureAttention => {
+                self.send(encode(keymap::secure_attention_sequence()).collect())
+            }
+            StripAction::None => {}
+        }
+        let (status, finished) = self.upload_frame(ui.ctx());
+        if let Some(msg) = status {
+            ui.horizontal(|ui| {
+                if !finished {
+                    ui.spinner();
+                }
+                ui.label(msg);
+            });
+        }
+
+        let Some((tex_id, size)) = self.texture.as_ref().map(|t| (t.id(), t.size_vec2())) else {
+            return;
+        };
+        egui::ScrollArea::both().show(ui, |ui| {
+            let response = ui.add(
+                egui::Image::new(egui::load::SizedTexture::new(tex_id, size))
+                    .sense(Sense::click_and_drag()),
+            );
+            self.forward_input(ui, &response);
+        });
+    }
+
+    /// Upload the newest framebuffer to the texture when it changed. Returns the
+    /// session's status line and whether the session has ended.
+    fn upload_frame(&mut self, ctx: &egui::Context) -> (Option<String>, bool) {
         // Snapshot the newest framebuffer under the lock, then release it before
         // the (potentially slow) GPU texture upload so the protocol thread isn't
         // blocked writing the next frame.
@@ -133,64 +306,99 @@ impl NativeSession {
             (new_image, f.status.clone(), f.finished)
         };
         if let Some(image) = new_image {
-            self.texture = Some(ui.ctx().load_texture("rdp-desktop", image, egui::TextureOptions::LINEAR));
+            self.texture =
+                Some(ctx.load_texture("rdp-desktop", image, egui::TextureOptions::LINEAR));
         }
-
-        if let Some(msg) = status {
-            ui.horizontal(|ui| {
-                if !finished {
-                    ui.spinner();
-                }
-                ui.label(msg);
-            });
-        }
-
-        let Some(tex) = &self.texture else { return };
-        let size = tex.size_vec2();
-        egui::ScrollArea::both().show(ui, |ui| {
-            let response = ui.add(
-                egui::Image::new(egui::load::SizedTexture::new(tex.id(), size))
-                    .sense(egui::Sense::click_and_drag()),
-            );
-            self.forward_input(ui, &response);
-        });
+        (status, finished)
     }
 
-    /// Translate egui pointer + keyboard into fast-path input events.
-    fn forward_input(&self, ui: &egui::Ui, response: &egui::Response) {
-        let mut events: InputBatch = Vec::new();
+    /// The 24 px bar above the desktop: host name on the left, session actions
+    /// on the right.
+    fn render_strip(&self, ui: &mut egui::Ui) -> StripAction {
+        let p = theme::current(ui);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), STRIP_H), Sense::hover());
+        ui.painter().rect_filled(rect, 0, p.bg2);
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            Stroke::new(1.0, p.line),
+        );
+        let builder = UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(STRIP_PAD, 0.0)))
+            .layout(Layout::left_to_right(Align::Center));
+        ui.scope_builder(builder, |ui| {
+            let name = RichText::new(&self.host)
+                .font(FontId::new(STRIP_NAME_SIZE, theme::medium()))
+                .color(p.text);
+            ui.add(Label::new(name).selectable(false).truncate());
+            ui.with_layout(Layout::right_to_left(Align::Center), strip_buttons)
+                .inner
+        })
+        .inner
+    }
 
-        if let Some(pos) = response.hover_pos() {
-            let rel = pos - response.rect.min;
-            let (x, y) = (rel.x.max(0.0) as u16, rel.y.max(0.0) as u16);
-            let mut flags = PTRFLAGS_MOVE;
-            if response.dragged_by(egui::PointerButton::Primary) || response.is_pointer_button_down_on() {
-                flags |= PTRFLAGS_DOWN | PTRFLAGS_BUTTON1;
-            } else if response.dragged_by(egui::PointerButton::Secondary) {
-                flags |= PTRFLAGS_DOWN | PTRFLAGS_BUTTON2;
-            }
-            events.push(mouse_event(flags, x, y));
+    /// Forward this frame's pointer and keyboard input to the session thread.
+    ///
+    /// The desktop image always owns keyboard focus, so every key is the
+    /// server's; the pointer is forwarded only while it is over the image.
+    fn forward_input(&mut self, ui: &egui::Ui, response: &egui::Response) {
+        response.request_focus();
+        ui.memory_mut(|m| m.set_focus_lock_filter(response.id, DESKTOP_EVENT_FILTER));
+        let mut batch: InputBatch = pointer_event(response).into_iter().collect();
+        ui.ctx()
+            .input(|i| batch.extend(translate_events(&mut self.keyboard, &i.events, i.modifiers)));
+        self.send(batch);
+    }
+
+    /// Hand a batch to the session thread.
+    fn send(&self, batch: InputBatch) {
+        if batch.is_empty() {
+            return;
         }
-
-        ui.ctx().input(|i| {
-            for ev in &i.events {
-                if let egui::Event::Text(text) = ev {
-                    for ch in text.chars() {
-                        events.push(unicode_event(ch as u16, true));
-                        events.push(unicode_event(ch as u16, false));
-                    }
-                }
-            }
-        });
-
-        if !events.is_empty() {
-            let _ = self.input_tx.send(events);
-        }
+        // A closed receiver means the protocol thread has exited and already
+        // reported why in `FrameState::status`; there is nothing to add here.
+        let _ = self.input_tx.send(batch);
     }
 }
 
+/// Right-aligned strip buttons (laid out right to left).
+fn strip_buttons(ui: &mut egui::Ui) -> StripAction {
+    ui.spacing_mut().button_padding.x = STRIP_BUTTON_PAD_X;
+    if strip_button(ui, "Disconnect", "Close this session").clicked() {
+        return StripAction::Disconnect;
+    }
+    if strip_button(
+        ui,
+        "Ctrl+Alt+Del",
+        "Send Ctrl+Alt+Del to the remote desktop",
+    )
+    .clicked()
+    {
+        return StripAction::SecureAttention;
+    }
+    StripAction::None
+}
+
+/// `widgets::icon_button` styling on a small button that fits the strip.
+fn strip_button(ui: &mut egui::Ui, text: &str, tip: &str) -> egui::Response {
+    let p = theme::current(ui);
+    ui.add(
+        Button::new(text)
+            .small()
+            .corner_radius(RADIUS)
+            .fill(p.bg2)
+            .stroke((1.0, p.line)),
+    )
+    .on_hover_text(tip)
+}
+
 /// Background thread body: connect, then pump frames and forward input.
-fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: Receiver<InputBatch>) {
+fn run_session(
+    params: SessionParams,
+    frame: Arc<Mutex<FrameState>>,
+    input_rx: Receiver<InputBatch>,
+) {
     let mut session = match RdpSession::connect(&params) {
         Ok(s) => {
             frame.lock().unwrap().status = Some("Connected".to_string());
@@ -209,7 +417,8 @@ fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: R
     // stays on the reliable TCP path — same as a real RDP client's fallback.
     if let Some(req) = session.multitransport_request() {
         frame.lock().unwrap().status = Some("Negotiating UDP transport…".to_string());
-        let peer: Option<std::net::SocketAddr> = format!("{}:{}", params.host, params.port).parse().ok();
+        let peer: Option<std::net::SocketAddr> =
+            format!("{}:{}", params.host, params.port).parse().ok();
         let local: Option<std::net::SocketAddr> = "0.0.0.0:0".parse().ok();
         let isn = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -274,5 +483,167 @@ fn run_session(params: SessionParams, frame: Arc<Mutex<FrameState>>, input_rx: R
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event, Key, Modifiers};
+    use ferropipe_rdp::input::KBDFLAGS_RELEASE;
+
+    /// A native `Event::Key` for a key at its own physical position.
+    fn key(k: Key, pressed: bool, modifiers: Modifiers) -> Event {
+        Event::Key {
+            key: k,
+            physical_key: Some(k),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Modifiers the way a Windows/Linux integration reports them (`command == ctrl`).
+    fn mods(shift: bool, ctrl: bool, alt: bool) -> Modifiers {
+        Modifiers {
+            shift,
+            ctrl,
+            alt,
+            command: ctrl,
+            mac_cmd: false,
+        }
+    }
+
+    fn scancode(code: KeyCode, pressed: bool) -> Outgoing {
+        keymap::key_event(code, pressed).encode()
+    }
+
+    fn unicode(unit: u16) -> [Outgoing; 2] {
+        [
+            input::unicode_event(unit, true),
+            input::unicode_event(unit, false),
+        ]
+    }
+
+    /// Whether `blob` is a fast-path Unicode keyboard event (event code 4).
+    fn is_unicode(blob: &[u8]) -> bool {
+        blob[0] >> 5 == 4
+    }
+
+    #[test]
+    fn mapped_key_press_yields_one_scancode_event() {
+        // Arrange
+        let mut bridge = KeyboardBridge::new();
+        let events = [key(Key::A, true, Modifiers::NONE)];
+        // Act
+        let out = translate_events(&mut bridge, &events, Modifiers::NONE);
+        // Assert
+        assert_eq!(out, vec![scancode(KeyCode::A, true)]);
+    }
+
+    #[test]
+    fn key_release_carries_the_release_flag() {
+        // Arrange
+        let mut bridge = KeyboardBridge::new();
+        let events = [key(Key::A, false, Modifiers::NONE)];
+        // Act
+        let out = translate_events(&mut bridge, &events, Modifiers::NONE);
+        // Assert
+        assert_eq!(out, vec![scancode(KeyCode::A, false)]);
+        assert_ne!(out[0][0] & KBDFLAGS_RELEASE, 0);
+    }
+
+    #[test]
+    fn text_right_after_mapped_press_is_swallowed() {
+        // Arrange: the scan code already carries the character.
+        let mut bridge = KeyboardBridge::new();
+        let events = [key(Key::A, true, Modifiers::NONE), Event::Text("a".into())];
+        // Act
+        let out = translate_events(&mut bridge, &events, Modifiers::NONE);
+        // Assert
+        assert_eq!(out, vec![scancode(KeyCode::A, true)]);
+    }
+
+    #[test]
+    fn text_after_unmapped_key_is_forwarded_as_unicode() {
+        // Arrange: F13 has no scan code, so the text is the only way through.
+        let mut bridge = KeyboardBridge::new();
+        let events = [
+            key(Key::F13, true, Modifiers::NONE),
+            Event::Text("x".into()),
+        ];
+        // Act
+        let out = translate_events(&mut bridge, &events, Modifiers::NONE);
+        // Assert
+        assert_eq!(out, unicode(u16::from(b'x')).to_vec());
+    }
+
+    #[test]
+    fn text_is_sent_as_utf16_units() {
+        // Arrange: one astral character is two UTF-16 units.
+        let mut bridge = KeyboardBridge::new();
+        let events = [Event::Text("\u{1F600}".into())];
+        let units: Vec<u16> = "\u{1F600}".encode_utf16().collect();
+        // Act
+        let out = translate_events(&mut bridge, &events, Modifiers::NONE);
+        // Assert
+        let expected: Vec<Outgoing> = units.iter().flat_map(|&u| unicode(u)).collect();
+        assert_eq!(units.len(), 2);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn ctrl_held_suppresses_text() {
+        // Arrange: Ctrl+C reported as text is a shortcut side effect, not typing.
+        let mut bridge = KeyboardBridge::new();
+        let ctrl = mods(false, true, false);
+        let events = [Event::Text("c".into())];
+        // Act
+        let out = translate_events(&mut bridge, &events, ctrl);
+        // Assert: the server gets Ctrl down (modifiers first) and no Unicode.
+        assert!(out.iter().all(|blob| !is_unicode(blob)), "{out:?}");
+        assert_eq!(out, vec![scancode(KeyCode::ControlLeft, true)]);
+    }
+
+    #[test]
+    fn focus_loss_releases_held_modifiers() {
+        // Arrange: a physical Shift is down on the server.
+        let mut bridge = KeyboardBridge::new();
+        let shift = mods(true, false, false);
+        let held = translate_events(&mut bridge, &[key(Key::ShiftLeft, true, shift)], shift);
+        assert_eq!(held, vec![scancode(KeyCode::ShiftLeft, true)]);
+        // Act: the window goes away while the OS still reports Shift held.
+        let out = translate_events(&mut bridge, &[Event::WindowFocused(false)], shift);
+        // Assert
+        assert_eq!(out, vec![scancode(KeyCode::ShiftLeft, false)]);
+    }
+
+    #[test]
+    fn copy_cut_paste_tap_the_letter_under_the_held_ctrl() {
+        // Arrange
+        let mut bridge = KeyboardBridge::new();
+        let events = [Event::Copy, Event::Cut, Event::Paste("ignored".into())];
+        // Act
+        let out = translate_events(&mut bridge, &events, Modifiers::NONE);
+        // Assert
+        let expected: Vec<Outgoing> = [KeyCode::C, KeyCode::X, KeyCode::V]
+            .into_iter()
+            .flat_map(|k| [scancode(k, true), scancode(k, false)])
+            .collect();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn pointer_events_are_not_translated() {
+        // Arrange: the mouse is forwarded from the image response, not from here.
+        let mut bridge = KeyboardBridge::new();
+        let events = [
+            Event::PointerMoved(egui::pos2(3.0, 4.0)),
+            Event::PointerGone,
+        ];
+        // Act
+        let out = translate_events(&mut bridge, &events, Modifiers::NONE);
+        // Assert
+        assert!(out.is_empty(), "{out:?}");
     }
 }

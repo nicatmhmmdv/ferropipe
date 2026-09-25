@@ -5,9 +5,9 @@
 //! PowerShell commands. All async winrm-rs calls are driven on a dedicated tokio runtime
 //! owned by this backend (which lives on the worker thread).
 
-use super::{copy_with_progress, Event, RStat, RemoteFs};
+use super::{Event, RStat, RemoteFs, copy_with_progress};
 use crate::model::{Connection, FileEntry};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use std::io::{Read, Write};
 use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
@@ -56,7 +56,12 @@ impl WinRmFs {
             conn.domain.clone(),
         );
         let client = WinrmClient::new(cfg, creds).map_err(|e| anyhow!("WinRM client: {e}"))?;
-        let mut fs = WinRmFs { rt, client, host: conn.host.clone(), home: "C:/".into() };
+        let mut fs = WinRmFs {
+            rt,
+            client,
+            host: conn.host.clone(),
+            home: "C:/".into(),
+        };
         // Probe connectivity + resolve home (surfaces auth errors at connect time).
         let out = fs
             .ps_ok("$env:USERPROFILE")
@@ -87,7 +92,11 @@ impl WinRmFs {
             let err = String::from_utf8_lossy(&o.stderr);
             return Err(anyhow!(
                 "{}",
-                if err.trim().is_empty() { format!("exit {}", o.exit_code) } else { err.trim().to_string() }
+                if err.trim().is_empty() {
+                    format!("exit {}", o.exit_code)
+                } else {
+                    err.trim().to_string()
+                }
             ));
         }
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
@@ -120,7 +129,10 @@ impl RemoteFs for WinRmFs {
             s: i64,
         }
         let s: S = serde_json::from_str(out.trim()).map_err(|e| anyhow!("stat parse: {e}"))?;
-        Ok(RStat { is_dir: s.d, size: s.s.max(0) as u64 })
+        Ok(RStat {
+            is_dir: s.d,
+            size: s.s.max(0) as u64,
+        })
     }
 
     fn list(&self, path: &str) -> Result<Vec<FileEntry>> {
@@ -154,7 +166,12 @@ impl RemoteFs for WinRmFs {
             .collect())
     }
 
-    fn read_file(&self, path: &str, out: &mut dyn Write, progress: &mut dyn FnMut(u64)) -> Result<()> {
+    fn read_file(
+        &self,
+        path: &str,
+        out: &mut dyn Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()> {
         // NamedTempFile: random name, created O_EXCL with 0600, auto-removed on drop.
         let tmp = tempfile::NamedTempFile::new().map_err(|e| anyhow!("temp: {e}"))?;
         let win = path.replace('/', "\\");
@@ -165,7 +182,12 @@ impl RemoteFs for WinRmFs {
         copy_with_progress(&mut f, out, progress)
     }
 
-    fn write_file(&self, path: &str, input: &mut dyn Read, progress: &mut dyn FnMut(u64)) -> Result<()> {
+    fn write_file(
+        &self,
+        path: &str,
+        input: &mut dyn Read,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()> {
         // Spill to a private temp, then use winrm's built-in chunked upload.
         let mut tmp = tempfile::NamedTempFile::new().map_err(|e| anyhow!("temp: {e}"))?;
         std::io::copy(input, tmp.as_file_mut())?;
@@ -180,27 +202,43 @@ impl RemoteFs for WinRmFs {
     }
 
     fn mkdir(&self, path: &str) -> Result<()> {
-        self.ps_ok(&format!("New-Item -ItemType Directory -Path {p} | Out-Null", p = psq(path)))?;
+        self.ps_ok(&format!(
+            "New-Item -ItemType Directory -Path {p} | Out-Null",
+            p = psq(path)
+        ))?;
         Ok(())
     }
 
     fn create_empty(&self, path: &str) -> Result<()> {
-        self.ps_ok(&format!("New-Item -ItemType File -Path {p} | Out-Null", p = psq(path)))?;
+        self.ps_ok(&format!(
+            "New-Item -ItemType File -Path {p} | Out-Null",
+            p = psq(path)
+        ))?;
         Ok(())
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        self.ps_ok(&format!("Move-Item -LiteralPath {f} -Destination {t} -Force", f = psq(from), t = psq(to)))?;
+        self.ps_ok(&format!(
+            "Move-Item -LiteralPath {f} -Destination {t} -Force",
+            f = psq(from),
+            t = psq(to)
+        ))?;
         Ok(())
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
-        self.ps_ok(&format!("Remove-Item -LiteralPath {p} -Force", p = psq(path)))?;
+        self.ps_ok(&format!(
+            "Remove-Item -LiteralPath {p} -Force",
+            p = psq(path)
+        ))?;
         Ok(())
     }
 
     fn remove_dir(&self, path: &str) -> Result<()> {
-        self.ps_ok(&format!("Remove-Item -LiteralPath {p} -Force", p = psq(path)))?;
+        self.ps_ok(&format!(
+            "Remove-Item -LiteralPath {p} -Force",
+            p = psq(path)
+        ))?;
         Ok(())
     }
 
@@ -210,10 +248,16 @@ impl RemoteFs for WinRmFs {
             .block_on(self.client.run_command(&self.host, command, &[]))
             .map_err(|e| anyhow!("{e}"))?;
         for line in String::from_utf8_lossy(&out.stdout).lines() {
-            emit(Event::ExecOutput { line: line.to_string(), is_err: false });
+            emit(Event::ExecOutput {
+                line: line.to_string(),
+                is_err: false,
+            });
         }
         for line in String::from_utf8_lossy(&out.stderr).lines() {
-            emit(Event::ExecOutput { line: line.to_string(), is_err: true });
+            emit(Event::ExecOutput {
+                line: line.to_string(),
+                is_err: true,
+            });
         }
         Ok(out.exit_code)
     }

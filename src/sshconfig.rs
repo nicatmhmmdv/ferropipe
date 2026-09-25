@@ -41,7 +41,10 @@ fn parse(text: &str) -> Vec<Connection> {
             c.port = d.port.unwrap_or(22);
             c.group = "ssh-config".into();
             c.auth = if let Some(key) = d.identity {
-                AuthMethod::Key { private_key: expand_tilde(&key), passphrase_enc: None }
+                AuthMethod::Key {
+                    private_key: expand_tilde(&key),
+                    passphrase_enc: None,
+                }
             } else {
                 AuthMethod::Agent
             };
@@ -54,8 +57,11 @@ fn parse(text: &str) -> Vec<Connection> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (key, value) = match line.split_once(|c: char| c == ' ' || c == '\t' || c == '=') {
-            Some((k, v)) => (k.trim().to_lowercase(), v.trim().trim_start_matches('=').trim().to_string()),
+        let (key, value) = match line.split_once([' ', '\t', '=']) {
+            Some((k, v)) => (
+                k.trim().to_lowercase(),
+                v.trim().trim_start_matches('=').trim().to_string(),
+            ),
             None => continue,
         };
         match key.as_str() {
@@ -63,7 +69,13 @@ fn parse(text: &str) -> Vec<Connection> {
                 flush(&mut cur, &mut out);
                 // Only take the first pattern token of a Host line.
                 let alias = value.split_whitespace().next().unwrap_or("").to_string();
-                cur = Some(Draft { alias, hostname: None, user: None, port: None, identity: None });
+                cur = Some(Draft {
+                    alias,
+                    hostname: None,
+                    user: None,
+                    port: None,
+                    identity: None,
+                });
             }
             "hostname" => {
                 if let Some(d) = cur.as_mut() {
@@ -93,10 +105,10 @@ fn parse(text: &str) -> Vec<Connection> {
 }
 
 fn expand_tilde(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
     }
     p.to_string()
 }
@@ -129,5 +141,34 @@ Host db
         assert!(matches!(conns[0].auth, AuthMethod::Key { .. }));
         assert_eq!(conns[1].name, "db");
         assert!(matches!(conns[1].auth, AuthMethod::Agent));
+    }
+
+    #[test]
+    fn parses_keys_separated_by_equals_or_tabs() {
+        let cfg = "Host=web2\nHostName = 10.0.0.9\nUser\tbob\nPort=2200\n";
+        let conns = parse(cfg);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].name, "web2");
+        assert_eq!(conns[0].host, "10.0.0.9");
+        assert_eq!(conns[0].username, "bob");
+        assert_eq!(conns[0].port, 2200);
+    }
+
+    #[test]
+    fn expand_tilde_replaces_a_leading_tilde_slash_with_home() {
+        let Ok(home) = std::env::var("HOME") else {
+            return; // nothing to expand against on this machine
+        };
+        assert_eq!(
+            expand_tilde("~/.ssh/id_ed25519"),
+            format!("{home}/.ssh/id_ed25519")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_leaves_other_paths_unchanged() {
+        assert_eq!(expand_tilde("/etc/ssh/key"), "/etc/ssh/key");
+        assert_eq!(expand_tilde("~user/key"), "~user/key");
+        assert_eq!(expand_tilde("~"), "~");
     }
 }

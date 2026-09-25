@@ -7,8 +7,8 @@
 //! inside Ferropipe's config dir.
 
 use crate::model::Connection;
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -41,8 +41,8 @@ fn remmina_secret() -> Option<String> {
 /// (always adding at least one byte), then base64. Returns `None` if the secret
 /// can't be decoded (caller falls back to the kiosk base64 format).
 fn remmina_encrypt(password: &str, secret_b64: &str) -> Option<String> {
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
     use cbc::cipher::generic_array::GenericArray;
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
     type Enc = cbc::Encryptor<des::TdesEde3>;
 
     let secret = B64.decode(secret_b64.trim()).ok()?;
@@ -129,17 +129,19 @@ fn profile_text(conn: &Connection, password: &str) -> String {
 /// racing a launch still in progress.
 fn prune_old_profiles(dir: &Path) {
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !(name.starts_with("ferropipe-") && name.ends_with(".remmina")) {
             continue;
         }
-        if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
-            if modified < cutoff {
-                let _ = std::fs::remove_file(entry.path());
-            }
+        if let Ok(modified) = entry.metadata().and_then(|m| m.modified())
+            && modified < cutoff
+        {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -164,7 +166,12 @@ pub fn launch(conn: &Connection, password: &str, config_dir: &std::path::Path) -
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+        // The profile embeds the (Remmina-encrypted) password: never leave it
+        // world-readable. Remove it rather than launch with loose permissions.
+        if let Err(e) = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&file);
+            return Err(e).context("restrict remmina profile permissions");
+        }
     }
     // Use the absolute path (robust against a minimal PATH when launched from a
     // desktop launcher) and fully detach stdio so Remmina outlives Ferropipe.

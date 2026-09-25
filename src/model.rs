@@ -62,7 +62,10 @@ impl ConnectionKind {
     }
     /// Whether this kind provides an in-app dual-pane file browser.
     pub fn browses_files(&self) -> bool {
-        matches!(self, ConnectionKind::Ssh | ConnectionKind::Smb | ConnectionKind::WinRm)
+        matches!(
+            self,
+            ConnectionKind::Ssh | ConnectionKind::Smb | ConnectionKind::WinRm
+        )
     }
 }
 
@@ -95,7 +98,11 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(name: impl Into<String>, host: impl Into<String>, username: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        host: impl Into<String>,
+        username: impl Into<String>,
+    ) -> Self {
         Connection {
             id: Uuid::new_v4(),
             name: name.into(),
@@ -152,10 +159,6 @@ pub struct FileEntry {
 impl FileEntry {
     pub fn kind_order(&self) -> u8 {
         // Directories sort before files by default.
-        if self.is_dir {
-            0
-        } else {
-            1
-        }
+        if self.is_dir { 0 } else { 1 }
     }
 }

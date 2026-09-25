@@ -1,9 +1,11 @@
 //! SFTP backend (ssh2 / libssh2), plus SSH connect + host-key verification + exec.
 
-use super::{copy_with_progress, Event, RStat, RemoteFs};
+use super::{Event, RStat, RemoteFs, copy_with_progress};
 use crate::model::{AuthMethod, Connection};
-use anyhow::{anyhow, Context, Result};
-use ssh2::{CheckResult, KnownHostFileKind, KnownHostKeyFormat, OpenFlags, OpenType, Session, Sftp};
+use anyhow::{Context, Result, anyhow};
+use ssh2::{
+    CheckResult, KnownHostFileKind, KnownHostKeyFormat, OpenFlags, OpenType, Session, Sftp,
+};
 use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -25,17 +27,28 @@ impl RemoteFs for SftpFs<'_> {
     }
 
     fn realpath(&self, path: &str) -> Result<String> {
-        Ok(self.sftp.realpath(Path::new(path))?.to_string_lossy().into_owned())
+        Ok(self
+            .sftp
+            .realpath(Path::new(path))?
+            .to_string_lossy()
+            .into_owned())
     }
 
     fn stat(&self, path: &str) -> Result<RStat> {
         let s = self.sftp.stat(Path::new(path))?;
-        Ok(RStat { is_dir: s.is_dir(), size: s.size.unwrap_or(0) })
+        Ok(RStat {
+            is_dir: s.is_dir(),
+            size: s.size.unwrap_or(0),
+        })
     }
 
     fn list(&self, path: &str) -> Result<Vec<crate::model::FileEntry>> {
         let mut out = Vec::new();
-        for (p, stat) in self.sftp.readdir(Path::new(path)).with_context(|| format!("readdir {path}"))? {
+        for (p, stat) in self
+            .sftp
+            .readdir(Path::new(path))
+            .with_context(|| format!("readdir {path}"))?
+        {
             let name = p
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -55,22 +68,42 @@ impl RemoteFs for SftpFs<'_> {
         Ok(out)
     }
 
-    fn read_file(&self, path: &str, out: &mut dyn std::io::Write, progress: &mut dyn FnMut(u64)) -> Result<()> {
-        let mut f = self.sftp.open(Path::new(path)).with_context(|| format!("open {path}"))?;
+    fn read_file(
+        &self,
+        path: &str,
+        out: &mut dyn std::io::Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()> {
+        let mut f = self
+            .sftp
+            .open(Path::new(path))
+            .with_context(|| format!("open {path}"))?;
         copy_with_progress(&mut f, out, progress)
     }
 
-    fn write_file(&self, path: &str, input: &mut dyn std::io::Read, progress: &mut dyn FnMut(u64)) -> Result<()> {
+    fn write_file(
+        &self,
+        path: &str,
+        input: &mut dyn std::io::Read,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()> {
         let tmp = format!("{path}.ferropipe-part");
         {
             let mut f = self
                 .sftp
-                .open_mode(Path::new(&tmp), OpenFlags::WRITE | OpenFlags::TRUNCATE | OpenFlags::CREATE, 0o644, OpenType::File)
+                .open_mode(
+                    Path::new(&tmp),
+                    OpenFlags::WRITE | OpenFlags::TRUNCATE | OpenFlags::CREATE,
+                    0o644,
+                    OpenType::File,
+                )
                 .with_context(|| format!("create remote {tmp}"))?;
             copy_with_progress(input, &mut f, progress)?;
         }
         let _ = self.sftp.unlink(Path::new(path));
-        self.sftp.rename(Path::new(&tmp), Path::new(path), None).with_context(|| format!("finalize {path}"))?;
+        self.sftp
+            .rename(Path::new(&tmp), Path::new(path), None)
+            .with_context(|| format!("finalize {path}"))?;
         Ok(())
     }
 
@@ -81,7 +114,8 @@ impl RemoteFs for SftpFs<'_> {
 
     fn create_empty(&self, path: &str) -> Result<()> {
         let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE;
-        self.sftp.open_mode(Path::new(path), flags, 0o644, OpenType::File)?;
+        self.sftp
+            .open_mode(Path::new(path), flags, 0o644, OpenType::File)?;
         Ok(())
     }
 
@@ -106,12 +140,18 @@ impl RemoteFs for SftpFs<'_> {
         let mut out = String::new();
         ch.read_to_string(&mut out).ok();
         for line in out.lines() {
-            emit(Event::ExecOutput { line: line.to_string(), is_err: false });
+            emit(Event::ExecOutput {
+                line: line.to_string(),
+                is_err: false,
+            });
         }
         let mut err = String::new();
         ch.stderr().read_to_string(&mut err).ok();
         for line in err.lines() {
-            emit(Event::ExecOutput { line: line.to_string(), is_err: true });
+            emit(Event::ExecOutput {
+                line: line.to_string(),
+                is_err: true,
+            });
         }
         ch.wait_close().ok();
         Ok(ch.exit_status().unwrap_or(-1))
@@ -125,8 +165,12 @@ pub fn connect(conn: &Connection, secret: Option<&str>) -> Result<Session> {
         .with_context(|| format!("resolve {addr}"))?
         .next()
         .ok_or_else(|| anyhow!("could not resolve {addr}"))?;
-    let tcp = TcpStream::connect_timeout(&sockaddr, CONNECT_TIMEOUT)
-        .with_context(|| format!("tcp connect {addr} (timeout {}s)", CONNECT_TIMEOUT.as_secs()))?;
+    let tcp = TcpStream::connect_timeout(&sockaddr, CONNECT_TIMEOUT).with_context(|| {
+        format!(
+            "tcp connect {addr} (timeout {}s)",
+            CONNECT_TIMEOUT.as_secs()
+        )
+    })?;
     tcp.set_read_timeout(Some(IO_TIMEOUT))?;
     tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut session = Session::new()?;
@@ -141,7 +185,9 @@ pub fn connect(conn: &Connection, secret: Option<&str>) -> Result<Session> {
             let pw = secret
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow!("no password stored (edit the connection and set one)"))?;
-            session.userauth_password(&conn.username, pw).context("password auth failed")?;
+            session
+                .userauth_password(&conn.username, pw)
+                .context("password auth failed")?;
         }
         AuthMethod::Key { private_key, .. } => {
             let key = Path::new(private_key);
@@ -179,7 +225,9 @@ fn known_hosts_path() -> PathBuf {
 
 fn verify_host_key(session: &Session, host: &str, port: u16) -> Result<()> {
     let (key_vec, key_type) = {
-        let (k, t) = session.host_key().ok_or_else(|| anyhow!("server presented no host key"))?;
+        let (k, t) = session
+            .host_key()
+            .ok_or_else(|| anyhow!("server presented no host key"))?;
         (k.to_vec(), t)
     };
     let mut kh = session.known_hosts()?;

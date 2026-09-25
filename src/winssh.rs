@@ -8,8 +8,8 @@
 //! explicit, user-initiated action so nothing is left listening silently.
 
 use crate::model::Connection;
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ssh2::Session;
 use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -48,14 +48,22 @@ pub const DISABLE_WINRM_PS: &str = "$ErrorActionPreference='SilentlyContinue'; D
 /// Enable/disable the OpenSSH server on the host. Prefers WinRM (SSH may be off,
 /// and disabling SSH over SSH would sever the channel).
 pub fn set_ssh_enabled(conn: &Connection, password: &str, enable: bool) -> Result<String> {
-    let script = if enable { ENABLE_SSH_PS } else { DISABLE_SSH_PS };
+    let script = if enable {
+        ENABLE_SSH_PS
+    } else {
+        DISABLE_SSH_PS
+    };
     interpret(run_ps_any(conn, password, script, false)?)
 }
 
 /// Enable/disable WinRM on the host. Prefers SSH (WinRM is off when enabling, and
 /// disabling WinRM over WinRM severs the channel).
 pub fn set_winrm_enabled(conn: &Connection, password: &str, enable: bool) -> Result<String> {
-    let script = if enable { ENABLE_WINRM_PS } else { DISABLE_WINRM_PS };
+    let script = if enable {
+        ENABLE_WINRM_PS
+    } else {
+        DISABLE_WINRM_PS
+    };
     interpret(run_ps_any(conn, password, script, true)?)
 }
 
@@ -67,10 +75,15 @@ fn interpret(out: String) -> Result<String> {
         .rev()
         .find(|l| l.contains("OK:") || l.contains("FAIL:"));
     match marker {
-        Some(l) if l.contains("FAIL:") => {
-            Err(anyhow!("{}", l.splitn(2, "FAIL:").nth(1).unwrap_or(l).trim()))
-        }
-        Some(l) => Ok(l.splitn(2, "OK:").nth(1).unwrap_or(l).trim().to_string()),
+        Some(l) if l.contains("FAIL:") => Err(anyhow!(
+            "{}",
+            l.split_once("FAIL:").map_or(l, |(_, rest)| rest).trim()
+        )),
+        Some(l) => Ok(l
+            .split_once("OK:")
+            .map_or(l, |(_, rest)| rest)
+            .trim()
+            .to_string()),
         None => Ok(out.trim().to_string()),
     }
 }
@@ -114,9 +127,14 @@ fn winrm_run_ps(conn: &Connection, password: &str, script: &str) -> Result<Strin
 /// which sidesteps all shell-quoting concerns).
 fn ssh_exec_ps(session: &Session, script: &str) -> Result<String> {
     let mut ch = session.channel_session()?;
-    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
     let encoded = B64.encode(utf16);
-    ch.exec(&format!("powershell -NonInteractive -NoProfile -EncodedCommand {encoded}"))?;
+    ch.exec(&format!(
+        "powershell -NonInteractive -NoProfile -EncodedCommand {encoded}"
+    ))?;
     let mut out = String::new();
     ch.read_to_string(&mut out).ok();
     let mut err = String::new();
@@ -127,7 +145,11 @@ fn ssh_exec_ps(session: &Session, script: &str) -> Result<String> {
         let err = err.trim();
         return Err(anyhow!(
             "powershell exit {code}{}",
-            if err.is_empty() { String::new() } else { format!(": {err}") }
+            if err.is_empty() {
+                String::new()
+            } else {
+                format!(": {err}")
+            }
         ));
     }
     Ok(out)
@@ -168,7 +190,9 @@ fn ssh_session(host: &str, username: &str, password: &str) -> Result<Session> {
     session.set_blocking(true);
     session.handshake().context("ssh handshake")?;
     if password.is_empty() {
-        return Err(anyhow!("no password stored for this connection (edit it and set one)"));
+        return Err(anyhow!(
+            "no password stored for this connection (edit it and set one)"
+        ));
     }
     session
         .userauth_password(username, password)
@@ -208,7 +232,9 @@ fn transfer_sftp(
     files: &[PathBuf],
 ) -> Result<TransferResult> {
     let session = ssh_session(host, username, password)?;
-    let sftp = session.sftp().context("open SFTP (OpenSSH sftp subsystem)")?;
+    let sftp = session
+        .sftp()
+        .context("open SFTP (OpenSSH sftp subsystem)")?;
 
     let dir = normalize_dir(remote_dir);
     let mut ok = 0usize;
@@ -278,7 +304,8 @@ fn upload_one(sftp: &ssh2::Sftp, local: &Path, remote_dir: &str) -> Result<()> {
     } else {
         format!("{remote_dir}/{name}")
     };
-    let mut src = std::fs::File::open(local).with_context(|| format!("open {}", local.display()))?;
+    let mut src =
+        std::fs::File::open(local).with_context(|| format!("open {}", local.display()))?;
     let mut dst = sftp
         .create(Path::new(&remote_path))
         .with_context(|| format!("create remote {remote_path} (does the folder exist?)"))?;
@@ -296,5 +323,32 @@ mod tests {
         assert_eq!(normalize_dir("Desktop/"), "Desktop");
         assert_eq!(normalize_dir(""), ".");
         assert_eq!(normalize_dir("   "), ".");
+    }
+
+    #[test]
+    fn interpret_returns_the_message_after_a_trailing_ok_marker() {
+        let out = "noise\nOK: sshd running \n".to_string();
+        assert_eq!(interpret(out).unwrap(), "sshd running");
+    }
+
+    #[test]
+    fn interpret_turns_a_fail_marker_into_an_error_with_the_reason() {
+        let out = "OK: step one\nFAIL: access denied\n".to_string();
+        let err = interpret(out).unwrap_err();
+        assert_eq!(err.to_string(), "access denied");
+    }
+
+    #[test]
+    fn interpret_uses_the_last_marker_line() {
+        let out = "FAIL: first try\nOK: retried fine\n".to_string();
+        assert_eq!(interpret(out).unwrap(), "retried fine");
+    }
+
+    #[test]
+    fn interpret_without_a_marker_returns_the_trimmed_output() {
+        assert_eq!(
+            interpret("  plain text \n".to_string()).unwrap(),
+            "plain text"
+        );
     }
 }

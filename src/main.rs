@@ -10,7 +10,9 @@ mod rdp;
 mod remote;
 mod sshconfig;
 mod store;
+mod theme;
 mod vault;
+mod widgets;
 mod winssh;
 
 use anyhow::Context;
@@ -39,6 +41,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Ferropipe",
         native_options,
-        Box::new(move |cc| Ok(Box::new(app::FerropipeApp::new(cc, store, vault, store_path)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::FerropipeApp::new(
+                cc, store, vault, store_path,
+            )))
+        }),
     )
 }

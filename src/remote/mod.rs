@@ -11,13 +11,13 @@ pub mod winrm;
 pub mod worker;
 
 use crate::model::FileEntry;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-pub use worker::{spawn, WorkerHandle};
+pub use worker::{WorkerHandle, spawn};
 
 const MAX_DEPTH: usize = 64;
 const CHUNK: usize = 64 * 1024;
@@ -35,9 +35,19 @@ pub trait RemoteFs {
     fn realpath(&self, path: &str) -> Result<String>;
     fn stat(&self, path: &str) -> Result<RStat>;
     fn list(&self, path: &str) -> Result<Vec<FileEntry>>;
-    fn read_file(&self, path: &str, out: &mut dyn Write, progress: &mut dyn FnMut(u64)) -> Result<()>;
+    fn read_file(
+        &self,
+        path: &str,
+        out: &mut dyn Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()>;
     /// Write a file atomically (temp + rename) from `input`.
-    fn write_file(&self, path: &str, input: &mut dyn Read, progress: &mut dyn FnMut(u64)) -> Result<()>;
+    fn write_file(
+        &self,
+        path: &str,
+        input: &mut dyn Read,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()>;
     fn mkdir(&self, path: &str) -> Result<()>;
     fn create_empty(&self, path: &str) -> Result<()>;
     fn rename(&self, from: &str, to: &str) -> Result<()>;
@@ -54,22 +64,48 @@ pub trait RemoteFs {
 
     /// Run a command, streaming stdout/stderr lines via `emit`. Returns the exit code.
     fn exec(&self, _command: &str, _emit: &dyn Fn(Event)) -> Result<i32> {
-        Err(anyhow!("command execution is not supported on this backend"))
+        Err(anyhow!(
+            "command execution is not supported on this backend"
+        ))
     }
 }
 
 /// Commands sent from the UI to the worker.
 /// NOTE: not `Debug` — `Connect` carries a plaintext secret.
 pub enum Command {
-    Connect { conn: Box<crate::model::Connection>, secret: Option<String> },
-    ListRemote { path: String },
-    Download { id: u64, remote: Vec<String>, local_dir: PathBuf },
-    Upload { id: u64, local: Vec<PathBuf>, remote_dir: String },
-    MkdirRemote { path: String },
-    CreateFileRemote { path: String },
-    RenameRemote { from: String, to: String },
-    DeleteRemote { paths: Vec<String> },
-    Exec { command: String },
+    Connect {
+        conn: Box<crate::model::Connection>,
+        secret: Option<String>,
+    },
+    ListRemote {
+        path: String,
+    },
+    Download {
+        id: u64,
+        remote: Vec<String>,
+        local_dir: PathBuf,
+    },
+    Upload {
+        id: u64,
+        local: Vec<PathBuf>,
+        remote_dir: String,
+    },
+    MkdirRemote {
+        path: String,
+    },
+    CreateFileRemote {
+        path: String,
+    },
+    RenameRemote {
+        from: String,
+        to: String,
+    },
+    DeleteRemote {
+        paths: Vec<String>,
+    },
+    Exec {
+        command: String,
+    },
     Disconnect,
     Shutdown,
 }
@@ -77,14 +113,33 @@ pub enum Command {
 /// Events sent from the worker back to the UI.
 #[derive(Debug)]
 pub enum Event {
-    Connected { home: String, kind: &'static str },
-    RemoteListing { path: String, entries: Vec<FileEntry> },
+    Connected {
+        home: String,
+        kind: &'static str,
+    },
+    RemoteListing {
+        path: String,
+        entries: Vec<FileEntry>,
+    },
     Progress(TransferProgress),
-    TransferDone { id: u64, ok: bool },
-    OpDone { refresh: Option<String> },
-    ExecOutput { line: String, is_err: bool },
-    ExecDone { code: i32 },
-    Error { context: String, message: String },
+    TransferDone {
+        id: u64,
+        ok: bool,
+    },
+    OpDone {
+        refresh: Option<String>,
+    },
+    ExecOutput {
+        line: String,
+        is_err: bool,
+    },
+    ExecDone {
+        code: i32,
+    },
+    Error {
+        context: String,
+        message: String,
+    },
     Disconnected,
 }
 
@@ -109,17 +164,19 @@ pub fn safe_component(name: &str) -> bool {
 
 pub fn parent_of(path: &str) -> Option<String> {
     let trimmed = path.trim_end_matches('/');
-    trimmed.rfind('/').map(|i| if i == 0 { "/".to_string() } else { trimmed[..i].to_string() })
+    trimmed.rfind('/').map(|i| {
+        if i == 0 {
+            "/".to_string()
+        } else {
+            trimmed[..i].to_string()
+        }
+    })
 }
 
 fn basename(path: &str) -> Option<String> {
     let t = path.trim_end_matches('/');
     let b = t.rsplit('/').next().unwrap_or(t).to_string();
-    if safe_component(&b) {
-        Some(b)
-    } else {
-        None
-    }
+    if safe_component(&b) { Some(b) } else { None }
 }
 
 /// The generic command loop, driven by any backend. Returns true on Shutdown.
@@ -129,48 +186,88 @@ pub fn serve(rx: &Receiver<Command>, emit: &dyn Fn(Event), fs: &dyn RemoteFs) ->
             Command::ListRemote { path } => {
                 let resolved = fs.realpath(&path).unwrap_or(path);
                 match fs.list(&resolved) {
-                    Ok(entries) => emit(Event::RemoteListing { path: resolved, entries }),
-                    Err(e) => emit(Event::Error { context: format!("list {resolved}"), message: format!("{e:#}") }),
+                    Ok(entries) => emit(Event::RemoteListing {
+                        path: resolved,
+                        entries,
+                    }),
+                    Err(e) => emit(Event::Error {
+                        context: format!("list {resolved}"),
+                        message: format!("{e:#}"),
+                    }),
                 }
             }
-            Command::Download { id, remote, local_dir } => {
+            Command::Download {
+                id,
+                remote,
+                local_dir,
+            } => {
                 let ok = match download(fs, id, &remote, &local_dir, emit) {
                     Ok(()) => true,
                     Err(e) => {
-                        emit(Event::Error { context: "download".into(), message: format!("{e:#}") });
+                        emit(Event::Error {
+                            context: "download".into(),
+                            message: format!("{e:#}"),
+                        });
                         false
                     }
                 };
                 emit(Event::TransferDone { id, ok });
             }
-            Command::Upload { id, local, remote_dir } => {
+            Command::Upload {
+                id,
+                local,
+                remote_dir,
+            } => {
                 let ok = match upload(fs, id, &local, &remote_dir, emit) {
                     Ok(()) => true,
                     Err(e) => {
-                        emit(Event::Error { context: "upload".into(), message: format!("{e:#}") });
+                        emit(Event::Error {
+                            context: "upload".into(),
+                            message: format!("{e:#}"),
+                        });
                         false
                     }
                 };
                 emit(Event::TransferDone { id, ok });
-                emit(Event::OpDone { refresh: Some(remote_dir) });
+                emit(Event::OpDone {
+                    refresh: Some(remote_dir),
+                });
             }
             Command::MkdirRemote { path } => match fs.mkdir(&path) {
-                Ok(_) => emit(Event::OpDone { refresh: parent_of(&path) }),
-                Err(e) => emit(Event::Error { context: format!("mkdir {path}"), message: format!("{e:#}") }),
+                Ok(_) => emit(Event::OpDone {
+                    refresh: parent_of(&path),
+                }),
+                Err(e) => emit(Event::Error {
+                    context: format!("mkdir {path}"),
+                    message: format!("{e:#}"),
+                }),
             },
             Command::CreateFileRemote { path } => match fs.create_empty(&path) {
-                Ok(_) => emit(Event::OpDone { refresh: parent_of(&path) }),
-                Err(e) => emit(Event::Error { context: format!("create {path}"), message: format!("{e:#}") }),
+                Ok(_) => emit(Event::OpDone {
+                    refresh: parent_of(&path),
+                }),
+                Err(e) => emit(Event::Error {
+                    context: format!("create {path}"),
+                    message: format!("{e:#}"),
+                }),
             },
             Command::RenameRemote { from, to } => match fs.rename(&from, &to) {
-                Ok(_) => emit(Event::OpDone { refresh: parent_of(&to) }),
-                Err(e) => emit(Event::Error { context: format!("rename {from}"), message: format!("{e:#}") }),
+                Ok(_) => emit(Event::OpDone {
+                    refresh: parent_of(&to),
+                }),
+                Err(e) => emit(Event::Error {
+                    context: format!("rename {from}"),
+                    message: format!("{e:#}"),
+                }),
             },
             Command::DeleteRemote { paths } => {
                 let refresh = paths.first().and_then(|p| parent_of(p));
                 for p in &paths {
                     if let Err(e) = delete_recursive(fs, p, 0) {
-                        emit(Event::Error { context: format!("delete {p}"), message: format!("{e:#}") });
+                        emit(Event::Error {
+                            context: format!("delete {p}"),
+                            message: format!("{e:#}"),
+                        });
                     }
                 }
                 emit(Event::OpDone { refresh });
@@ -178,7 +275,10 @@ pub fn serve(rx: &Receiver<Command>, emit: &dyn Fn(Event), fs: &dyn RemoteFs) ->
             Command::Exec { command } => match fs.exec(&command, emit) {
                 Ok(code) => emit(Event::ExecDone { code }),
                 Err(e) => {
-                    emit(Event::Error { context: "exec".into(), message: format!("{e:#}") });
+                    emit(Event::Error {
+                        context: "exec".into(),
+                        message: format!("{e:#}"),
+                    });
                     emit(Event::ExecDone { code: -1 });
                 }
             },
@@ -190,7 +290,13 @@ pub fn serve(rx: &Receiver<Command>, emit: &dyn Fn(Event), fs: &dyn RemoteFs) ->
     false
 }
 
-fn download(fs: &dyn RemoteFs, id: u64, remote: &[String], local_dir: &Path, emit: &dyn Fn(Event)) -> Result<()> {
+fn download(
+    fs: &dyn RemoteFs,
+    id: u64,
+    remote: &[String],
+    local_dir: &Path,
+    emit: &dyn Fn(Event),
+) -> Result<()> {
     let mut files: Vec<(String, PathBuf, u64)> = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
     for r in remote {
@@ -215,7 +321,10 @@ fn download(fs: &dyn RemoteFs, id: u64, remote: &[String], local_dir: &Path, emi
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let fname = dst.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let fname = dst
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let tmp = dst.with_extension("ferropipe-part");
         {
             let mut out = std::fs::File::create(&tmp)?;
@@ -224,7 +333,12 @@ fn download(fs: &dyn RemoteFs, id: u64, remote: &[String], local_dir: &Path, emi
                 if last.elapsed() >= PROGRESS_EVERY {
                     last = Instant::now();
                     emit(Event::Progress(TransferProgress {
-                        id, current_file: fname.clone(), file_index: idx + 1, file_count, bytes_done, bytes_total,
+                        id,
+                        current_file: fname.clone(),
+                        file_index: idx + 1,
+                        file_count,
+                        bytes_done,
+                        bytes_total,
                     }));
                 }
             })?;
@@ -232,7 +346,14 @@ fn download(fs: &dyn RemoteFs, id: u64, remote: &[String], local_dir: &Path, emi
         }
         std::fs::rename(&tmp, dst)?;
     }
-    emit(Event::Progress(TransferProgress { id, current_file: String::new(), file_index: file_count, file_count, bytes_done, bytes_total }));
+    emit(Event::Progress(TransferProgress {
+        id,
+        current_file: String::new(),
+        file_index: file_count,
+        file_count,
+        bytes_done,
+        bytes_total,
+    }));
     Ok(())
 }
 
@@ -263,11 +384,20 @@ fn walk_remote(
     Ok(())
 }
 
-fn upload(fs: &dyn RemoteFs, id: u64, local: &[PathBuf], remote_dir: &str, emit: &dyn Fn(Event)) -> Result<()> {
+fn upload(
+    fs: &dyn RemoteFs,
+    id: u64,
+    local: &[PathBuf],
+    remote_dir: &str,
+    emit: &dyn Fn(Event),
+) -> Result<()> {
     let mut files: Vec<(PathBuf, String, u64)> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
     for l in local {
-        let base = l.file_name().map(|n| n.to_string_lossy().into_owned()).filter(|n| safe_component(n))
+        let base = l
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| safe_component(n))
             .ok_or_else(|| anyhow!("unsafe local name"))?;
         let meta = std::fs::symlink_metadata(l)?;
         if meta.is_dir() {
@@ -286,19 +416,34 @@ fn upload(fs: &dyn RemoteFs, id: u64, local: &[PathBuf], remote_dir: &str, emit:
     let mut bytes_done = 0u64;
     let mut last = Instant::now();
     for (idx, (src, dst, _)) in files.iter().enumerate() {
-        let fname = Path::new(dst).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let fname = Path::new(dst)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut input = std::fs::File::open(src)?;
         fs.write_file(dst, &mut input, &mut |delta| {
             bytes_done += delta;
             if last.elapsed() >= PROGRESS_EVERY {
                 last = Instant::now();
                 emit(Event::Progress(TransferProgress {
-                    id, current_file: fname.clone(), file_index: idx + 1, file_count, bytes_done, bytes_total,
+                    id,
+                    current_file: fname.clone(),
+                    file_index: idx + 1,
+                    file_count,
+                    bytes_done,
+                    bytes_total,
                 }));
             }
         })?;
     }
-    emit(Event::Progress(TransferProgress { id, current_file: String::new(), file_index: file_count, file_count, bytes_done, bytes_total }));
+    emit(Event::Progress(TransferProgress {
+        id,
+        current_file: String::new(),
+        file_index: file_count,
+        file_count,
+        bytes_done,
+        bytes_total,
+    }));
     Ok(())
 }
 

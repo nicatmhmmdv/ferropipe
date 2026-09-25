@@ -3,6 +3,11 @@ name = "ferropipe"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Embed the four IBM Plex faces from assets/fonts/ instead of discovering fonts at runtime.
+bundled-fonts = []
+
 [dependencies]
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 anyhow = "1.0.104"
@@ -12,9 +17,11 @@ chrono = "0.4.45"
 crossbeam-channel = "0.5.16"
 directories = "6.0.0"
 eframe = "0.36.1"
-ferropipe-rdp = { path = "../ferropipe-rdp" }
+ferropipe-rdp = { path = "../ferropipe-rdp", features = ["egui"] }
 egui = "0.36.1"
-egui_extras = "0.36.1"
+egui_extras = { version = "0.36.1", features = ["image"] }
+# Enables the PNG decoder behind egui_extras' image loader (the top-bar logo).
+image = { version = "0.25", default-features = false, features = ["png"] }
 pavao = "0.2.16"
 rand = "0.8"
 rfd = "0.17.2"

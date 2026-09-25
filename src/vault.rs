@@ -10,10 +10,10 @@
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use rand::rngs::OsRng;
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use rand::RngCore;
+use rand::rngs::OsRng;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
@@ -160,6 +160,9 @@ mod tests {
         let a = temp_vault();
         let b = temp_vault();
         let enc = a.encrypt("secret").unwrap();
-        assert!(b.decrypt(&enc).is_err(), "decrypt should fail under a different key");
+        assert!(
+            b.decrypt(&enc).is_err(),
+            "decrypt should fail under a different key"
+        );
     }
 }

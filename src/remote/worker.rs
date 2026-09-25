@@ -2,7 +2,7 @@
 //! generic command loop against it.
 
 use super::sftp::{self, SftpFs};
-use super::{serve, smb, winrm, Command, Event};
+use super::{Command, Event, serve, smb, winrm};
 use crate::model::ConnectionKind;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
@@ -59,54 +59,94 @@ fn worker_main(rx: Receiver<Command>, tx: Sender<Event>, repaint: impl Fn()) {
     }
 }
 
-fn run_ssh(rx: &Receiver<Command>, emit: &dyn Fn(Event), conn: &crate::model::Connection, secret: Option<&str>) -> bool {
+fn run_ssh(
+    rx: &Receiver<Command>,
+    emit: &dyn Fn(Event),
+    conn: &crate::model::Connection,
+    secret: Option<&str>,
+) -> bool {
     let session = match sftp::connect(conn, secret) {
         Ok(s) => s,
         Err(e) => {
-            emit(Event::Error { context: "connect".into(), message: format!("{e:#}") });
+            emit(Event::Error {
+                context: "connect".into(),
+                message: format!("{e:#}"),
+            });
             return false;
         }
     };
     let sftp = match session.sftp() {
         Ok(s) => s,
         Err(e) => {
-            emit(Event::Error { context: "open sftp".into(), message: e.to_string() });
+            emit(Event::Error {
+                context: "open sftp".into(),
+                message: e.to_string(),
+            });
             return false;
         }
     };
     let home = sftp::resolve_home(&sftp);
-    emit(Event::Connected { home: home.clone(), kind: "SFTP" });
-    let fs = SftpFs { session: &session, sftp: &sftp, home };
+    emit(Event::Connected {
+        home: home.clone(),
+        kind: "SFTP",
+    });
+    let fs = SftpFs {
+        session: &session,
+        sftp: &sftp,
+        home,
+    };
     let shutdown = serve(rx, emit, &fs);
     emit(Event::Disconnected);
     shutdown
 }
 
-fn run_smb(rx: &Receiver<Command>, emit: &dyn Fn(Event), conn: &crate::model::Connection, secret: Option<&str>) -> bool {
+fn run_smb(
+    rx: &Receiver<Command>,
+    emit: &dyn Fn(Event),
+    conn: &crate::model::Connection,
+    secret: Option<&str>,
+) -> bool {
     match smb::SmbFs::connect(conn, secret) {
         Ok(fs) => {
-            emit(Event::Connected { home: fs.home(), kind: "SMB" });
+            emit(Event::Connected {
+                home: fs.home(),
+                kind: "SMB",
+            });
             let shutdown = serve(rx, emit, &fs);
             emit(Event::Disconnected);
             shutdown
         }
         Err(e) => {
-            emit(Event::Error { context: "smb connect".into(), message: format!("{e:#}") });
+            emit(Event::Error {
+                context: "smb connect".into(),
+                message: format!("{e:#}"),
+            });
             false
         }
     }
 }
 
-fn run_winrm(rx: &Receiver<Command>, emit: &dyn Fn(Event), conn: &crate::model::Connection, secret: Option<&str>) -> bool {
+fn run_winrm(
+    rx: &Receiver<Command>,
+    emit: &dyn Fn(Event),
+    conn: &crate::model::Connection,
+    secret: Option<&str>,
+) -> bool {
     match winrm::WinRmFs::connect(conn, secret) {
         Ok(fs) => {
-            emit(Event::Connected { home: fs.home(), kind: "WinRM" });
+            emit(Event::Connected {
+                home: fs.home(),
+                kind: "WinRM",
+            });
             let shutdown = serve(rx, emit, &fs);
             emit(Event::Disconnected);
             shutdown
         }
         Err(e) => {
-            emit(Event::Error { context: "winrm connect".into(), message: format!("{e:#}") });
+            emit(Event::Error {
+                context: "winrm connect".into(),
+                message: format!("{e:#}"),
+            });
             false
         }
     }

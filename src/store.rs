@@ -24,6 +24,9 @@ pub struct Settings {
     pub confirm_delete: bool,
     #[serde(default)]
     pub last_local_dir: Option<String>,
+    /// Show the Commander function-key bar; the keys themselves always work.
+    #[serde(default)]
+    pub show_fkeys: bool,
 }
 
 fn default_theme() -> bool {
@@ -40,6 +43,7 @@ impl Default for Settings {
             show_hidden: false,
             confirm_delete: true,
             last_local_dir: None,
+            show_fkeys: false,
         }
     }
 }
@@ -105,4 +109,40 @@ impl Store {
 
 pub fn store_path(dirs: &ProjectDirs) -> PathBuf {
     dirs.config_dir().join("connections.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_show_fkeys_is_off_by_default() {
+        assert!(!Settings::default().show_fkeys);
+    }
+
+    #[test]
+    fn settings_written_before_show_fkeys_existed_still_load_with_it_off() {
+        // Arrange: a settings object from an older connections.json.
+        let raw = r#"{"dark_mode": false, "show_hidden": true, "confirm_delete": true}"#;
+        // Act
+        let settings: Settings = serde_json::from_str(raw).expect("old settings parse");
+        // Assert
+        assert!(!settings.show_fkeys);
+        assert!(!settings.dark_mode);
+        assert!(settings.show_hidden);
+    }
+
+    #[test]
+    fn settings_show_fkeys_round_trips_through_json() {
+        // Arrange
+        let settings = Settings {
+            show_fkeys: true,
+            ..Settings::default()
+        };
+        // Act
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let back: Settings = serde_json::from_str(&json).expect("parse");
+        // Assert
+        assert!(back.show_fkeys);
+    }
 }

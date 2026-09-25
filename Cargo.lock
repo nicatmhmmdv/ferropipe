@@ -1235,6 +1235,7 @@ dependencies = [
  "ahash",
  "egui",
  "enum-map",
+ "image",
  "itertools",
  "log",
  "mime_guess2",
@@ -1443,6 +1444,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "ferropipe-rdp",
+ "image",
  "pavao",
  "rand 0.8.8",
  "rfd",
@@ -1461,6 +1463,7 @@ name = "ferropipe-rdp"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "egui",
  "hmac 0.12.1",
  "md-5 0.10.6",
  "md4 0.10.2",
