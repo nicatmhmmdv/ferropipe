@@ -29,8 +29,14 @@ pub fn spawn(
         .expect("spawn remote worker")
 }
 
+/// The worker's event sink. Every `Error` any backend or the generic loop
+/// emits passes through here, so it is logged once under its context even
+/// when the UI later folds it into a transfer row instead of a toast.
 fn worker_main(rx: Receiver<Command>, tx: Sender<Event>, repaint: impl Fn()) {
     let emit = move |ev: Event| {
+        if let Event::Error { context, message } = &ev {
+            crate::diag::log(crate::diag::Level::Error, context, message);
+        }
         let _ = tx.send(ev);
         repaint();
     };
@@ -58,7 +64,8 @@ fn worker_main(rx: Receiver<Command>, tx: Sender<Event>, repaint: impl Fn()) {
                 id,
                 paths,
                 dest_dir,
-            }) => copy_local_command(id, &paths, &dest_dir, &emit),
+                on_conflict,
+            }) => copy_local_command(id, &paths, &dest_dir, on_conflict, &emit),
             Ok(Command::Shutdown) | Err(_) => break,
             Ok(_) => { /* ignore ops while disconnected */ }
         }

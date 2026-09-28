@@ -12,6 +12,7 @@ impl FerropipeApp {
         ctx: &egui::Context,
         payload: DragPayload,
         dest: Side,
+        on_conflict: OnConflict,
     ) {
         let dest_dir = PathBuf::from(&self.side_pane(dest).cwd);
         let spec = self.transfer_spec(&payload, dest, dest, Verb::Copy);
@@ -23,6 +24,7 @@ impl FerropipeApp {
                 id,
                 paths,
                 dest_dir,
+                on_conflict,
             },
         );
     }

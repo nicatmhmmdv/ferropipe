@@ -23,6 +23,7 @@ impl FerropipeApp {
         self.render_editor(ctx);
         self.render_prompt(ctx);
         self.render_confirm_delete(ctx);
+        self.render_conflict_prompt(ctx);
     }
 
     /// Modal text prompt (new folder / new file / rename).

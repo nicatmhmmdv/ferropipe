@@ -4,16 +4,20 @@
 //! Pure helpers (labels, phase, rate, status text, pruning, toast copy) sit at
 //! the top and are unit-tested; the `FerropipeApp` methods below them wire the
 //! worker events and the drawer actions. The gutter arrows live in `gutter`,
-//! local → local copies in `super::local_copy`.
+//! local → local copies in `super::local_copy`, remote → remote staging in
+//! `staged`.
 
 use super::*;
 use crate::localfs::human_size;
 use crate::remote::TransferProgress;
 use crate::theme;
-use crate::widgets::{self, TransferAction, TransferPhase, TransferView};
+use crate::widgets::{self, Direction, TransferAction, TransferPhase, TransferView};
 use egui::{Align, FontFamily, FontId, Frame, Label, Layout, Margin, ScrollArea, Ui};
 
 mod gutter;
+mod staged;
+
+pub(super) use staged::StageJob;
 
 /// Seconds a completed transfer lingers in the drawer before it is pruned.
 const DONE_LINGER_SECS: f64 = 3.0;
@@ -38,7 +42,7 @@ pub(super) struct TransferState {
     pub label: String,
     /// Display target: "host:dir" or a local directory with `~`.
     pub dest: String,
-    /// Drawn with an up arrow: the worker is the destination side.
+    /// The worker is the destination side (uploads and the staged upload leg).
     pub upload: bool,
     /// How the finished transfer is described.
     pub verb: Verb,
@@ -99,16 +103,6 @@ impl TransferState {
     }
 }
 
-/// A remote→remote staged transfer awaiting its upload leg.
-pub(super) struct StageJob {
-    pub temp_dir: PathBuf,
-    pub names: Vec<String>,
-    pub dest_dir: String,
-    pub dest: Side,
-    pub label: String,
-    pub dest_label: String,
-}
-
 /// How many transfers sit in each phase, plus how many are still unfinished.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct PhaseCounts {
@@ -142,6 +136,15 @@ impl Verb {
             Verb::Download => "Download",
             Verb::Copy => "Copy",
         }
+    }
+}
+
+/// The drawer direction (and glyph) a verb is drawn with.
+pub(super) fn direction_of(verb: Verb) -> Direction {
+    match verb {
+        Verb::Upload => Direction::Upload,
+        Verb::Download => Direction::Download,
+        Verb::Copy => Direction::Copy,
     }
 }
 
@@ -373,7 +376,7 @@ impl FerropipeApp {
         t.file_index = p.file_index;
         t.file_count = p.file_count;
         if !p.current_file.is_empty() {
-            let arrow = if t.upload { "↑" } else { "↓" };
+            let arrow = direction_of(t.verb).glyph();
             self.status = format!("{arrow} {}", p.current_file);
         }
     }
@@ -412,8 +415,21 @@ impl FerropipeApp {
 
     // -- starting ---------------------------------------------------------
 
-    /// Move `payload`'s paths into `dest`'s current directory.
+    /// Move `payload`'s paths into `dest`'s current directory, asking before
+    /// anything already there is written over.
     pub(super) fn start_transfer(&mut self, ctx: &egui::Context, payload: DragPayload, dest: Side) {
+        self.start_transfer_with(ctx, payload, dest, OnConflict::Ask);
+    }
+
+    /// Move `payload`'s paths into `dest`'s current directory, treating files
+    /// already there per `on_conflict`.
+    pub(super) fn start_transfer_with(
+        &mut self,
+        ctx: &egui::Context,
+        payload: DragPayload,
+        dest: Side,
+        on_conflict: OnConflict,
+    ) {
         if payload.side == dest || payload.paths.is_empty() {
             return;
         }
@@ -430,10 +446,29 @@ impl FerropipeApp {
             return;
         }
         match (payload.remote, self.side_is_remote(dest)) {
-            (true, false) => self.start_download(ctx, payload, dest),
-            (false, true) => self.start_upload(ctx, payload, dest),
-            (true, true) => self.start_staged(ctx, payload, dest),
-            (false, false) => self.start_local_copy(ctx, payload, dest),
+            (true, false) => self.start_download(ctx, payload, dest, on_conflict),
+            (false, true) => self.start_upload(ctx, payload, dest, on_conflict),
+            (true, true) => self.start_staged(ctx, payload, dest, on_conflict),
+            (false, false) => self.start_local_copy(ctx, payload, dest, on_conflict),
+        }
+    }
+
+    /// Re-run a remembered request with `on_conflict`, as long as both panes
+    /// still show the hosts it was aimed at.
+    pub(super) fn replay_request(
+        &mut self,
+        ctx: &egui::Context,
+        req: RetryRequest,
+        on_conflict: OnConflict,
+    ) {
+        if retry_allowed(req.hosts, self.session_hosts()) {
+            self.start_transfer_with(ctx, req.payload, req.dest, on_conflict);
+        } else {
+            self.toast(
+                ctx,
+                "A pane changed host since this transfer — select the files again",
+                true,
+            );
         }
     }
 
@@ -466,7 +501,13 @@ impl FerropipeApp {
     }
 
     /// remote → local: the source worker downloads into the destination pane's directory.
-    fn start_download(&mut self, ctx: &egui::Context, payload: DragPayload, dest: Side) {
+    fn start_download(
+        &mut self,
+        ctx: &egui::Context,
+        payload: DragPayload,
+        dest: Side,
+        on_conflict: OnConflict,
+    ) {
         let local_dir = PathBuf::from(&self.side_pane(dest).cwd);
         let spec = self.transfer_spec(&payload, dest, payload.side, Verb::Download);
         let id = self.push_transfer(ctx, spec);
@@ -474,12 +515,19 @@ impl FerropipeApp {
             id,
             remote: payload.paths,
             local_dir,
+            on_conflict,
         };
         self.side_send(payload.side, cmd);
     }
 
     /// local → remote: the destination worker uploads into its pane's directory.
-    fn start_upload(&mut self, ctx: &egui::Context, payload: DragPayload, dest: Side) {
+    fn start_upload(
+        &mut self,
+        ctx: &egui::Context,
+        payload: DragPayload,
+        dest: Side,
+        on_conflict: OnConflict,
+    ) {
         let remote_dir = self.side_pane(dest).cwd.clone();
         let spec = self.transfer_spec(&payload, dest, dest, Verb::Upload);
         let id = self.push_transfer(ctx, spec);
@@ -490,38 +538,9 @@ impl FerropipeApp {
                 id,
                 local,
                 remote_dir,
+                on_conflict,
             },
         );
-    }
-
-    /// remote → remote: download into a temp dir now, upload from it when that finishes.
-    fn start_staged(&mut self, ctx: &egui::Context, payload: DragPayload, dest: Side) {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "ferropipe-r2r-{}-{}",
-            std::process::id(),
-            self.next_id
-        ));
-        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-            self.toast(ctx, format!("stage: {e:#}"), true);
-            return;
-        }
-        let spec = self.transfer_spec(&payload, dest, payload.side, Verb::Copy);
-        let job = StageJob {
-            temp_dir: temp_dir.clone(),
-            names: payload.paths.iter().map(|p| base_name(p)).collect(),
-            dest_dir: self.side_pane(dest).cwd.clone(),
-            dest,
-            label: spec.label.clone(),
-            dest_label: spec.dest.clone(),
-        };
-        let id = self.push_transfer(ctx, spec);
-        let cmd = Command::Download {
-            id,
-            remote: payload.paths,
-            local_dir: temp_dir,
-        };
-        self.side_send(payload.side, cmd);
-        self.stage_download.insert(id, job);
     }
 
     // -- finishing --------------------------------------------------------
@@ -542,8 +561,8 @@ impl FerropipeApp {
         };
         if let Some(job) = self.stage_download.remove(&id) {
             self.finish_stage_download(ctx, job, done);
-        } else if let Some(temp) = self.stage_cleanup.remove(&id) {
-            let _ = std::fs::remove_dir_all(&temp);
+        } else if let Some(job) = self.stage_cleanup.remove(&id) {
+            let _ = std::fs::remove_dir_all(&job.temp_dir);
             self.toast_result(ctx, &done);
         } else {
             self.finish_plain(ctx, done);
@@ -567,32 +586,6 @@ impl FerropipeApp {
             elapsed: now - t.started_at,
             error,
         })
-    }
-
-    /// The staged download leg ended: start the upload leg, or give up.
-    fn finish_stage_download(&mut self, ctx: &egui::Context, job: StageJob, done: Finished) {
-        if done.error.is_some() {
-            let _ = std::fs::remove_dir_all(&job.temp_dir);
-            self.toast_result(ctx, &done);
-            return;
-        }
-        let spec = NewTransfer {
-            worker: job.dest,
-            label: job.label,
-            dest: job.dest_label,
-            upload: true,
-            verb: Verb::Copy,
-            retry: None,
-        };
-        let id = self.push_transfer(ctx, spec);
-        let local = job.names.iter().map(|n| job.temp_dir.join(n)).collect();
-        let cmd = Command::Upload {
-            id,
-            local,
-            remote_dir: job.dest_dir,
-        };
-        self.side_send(job.dest, cmd);
-        self.stage_cleanup.insert(id, job.temp_dir);
     }
 
     /// An unstaged transfer ended: relist a local destination and report.
@@ -657,7 +650,7 @@ impl FerropipeApp {
                 for (t, &phase) in self.transfers.iter().zip(phases) {
                     let status = status_text(t, phase, now);
                     let view = TransferView {
-                        upload: t.upload,
+                        direction: direction_of(t.verb),
                         label: &t.label,
                         dest: &t.dest,
                         frac: frac_of(t),
@@ -691,14 +684,7 @@ impl FerropipeApp {
                 continue;
             }
             match removed.retry {
-                Some(req) if retry_allowed(req.hosts, self.session_hosts()) => {
-                    self.start_transfer(ctx, req.payload, req.dest);
-                }
-                Some(_) => self.toast(
-                    ctx,
-                    "A pane changed host since this transfer — select the files again",
-                    true,
-                ),
+                Some(req) => self.replay_request(ctx, req, OnConflict::Ask),
                 None => self.toast(ctx, "This step can't be retried", true),
             }
         }

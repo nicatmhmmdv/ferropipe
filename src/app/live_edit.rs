@@ -41,10 +41,12 @@ impl FerropipeApp {
         );
         self.side_send(
             side,
+            // The temp dir is private to this edit, so nothing can be in the way.
             Command::Download {
                 id,
                 remote: vec![remote_path],
                 local_dir: dir,
+                on_conflict: OnConflict::Overwrite,
             },
         );
         self.toast(ctx, format!("Opening {name} for editing…"), false);
@@ -92,10 +94,12 @@ impl FerropipeApp {
             let id = self.push_transfer(ctx, spec);
             self.side_send(
                 side,
+                // Replacing the edited file is the point of the sync.
                 Command::Upload {
                     id,
                     local: vec![temp],
                     remote_dir: dir,
+                    on_conflict: OnConflict::Overwrite,
                 },
             );
             self.toast(ctx, format!("Syncing {name} → remote"), false);

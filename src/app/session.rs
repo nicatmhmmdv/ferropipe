@@ -2,6 +2,7 @@
 //! report back, and the `side_*` helpers that address one pane's state.
 
 use super::*;
+use crate::diag::{diag_error, diag_info};
 
 /// Whether `side` browses a remote host, given each pane's mode flag: the
 /// left is local unless `left_remote`, the right remote unless `right_local`.
@@ -10,6 +11,13 @@ pub(super) fn pane_is_remote(side: Side, left_remote: bool, right_local: bool) -
         Side::Left => left_remote,
         Side::Right => !right_local,
     }
+}
+
+/// The diagnostics line for a connect attempt: name, kind and target. Never
+/// the credentials — `conn` only carries them encrypted, and even that blob
+/// stays out of the log.
+pub(super) fn connect_line(conn: &Connection) -> String {
+    format!("{} ({}) -> {}", conn.name, conn.kind.label(), conn.target())
 }
 
 impl FerropipeApp {
@@ -61,6 +69,7 @@ impl FerropipeApp {
         self.pending_connect = Some(id);
         self.connecting = true;
         self.status = format!("Connecting to {}…", conn.target());
+        diag_info!("connect", "right pane: {}", connect_line(&conn));
         self.toast(ctx, format!("Connecting to {}", conn.name), false);
         self.worker.send(Command::Connect {
             conn: Box::new(conn),
@@ -283,6 +292,7 @@ impl FerropipeApp {
         self.local.home = None;
         self.lpending = Some(id);
         self.lconnecting = true;
+        diag_info!("connect", "left pane: {}", connect_line(&conn));
         self.lworker.send(Command::Connect {
             conn: Box::new(conn),
             secret,
@@ -333,6 +343,7 @@ impl FerropipeApp {
             Event::RemoteListing { path, entries } => self.on_listing(side, path, entries),
             Event::Progress(p) => self.on_progress(p),
             Event::TransferDone { id, ok } => self.on_transfer_done(ctx, side, id, ok),
+            Event::Conflicts { id, conflicts } => self.on_conflicts(ctx, id, conflicts),
             Event::OpDone { refresh } => self.on_op_done(side, refresh),
             Event::ExecOutput { line, is_err, .. } => {
                 self.console.push((line, is_err));
@@ -384,15 +395,19 @@ impl FerropipeApp {
         if let Some(id) = self.side_host(side) {
             self.host_errors.remove(&id);
         }
+        let name = self.side_name(side);
+        diag_info!("connect", "{name} connected ({kind}), home {home}");
         self.side_send(side, Command::ListRemote { path: home });
     }
 
-    /// A remote listing arrived. One for a pane that has since gone back to
-    /// this computer is stale and must not replace the local listing.
-    fn on_listing(&mut self, side: Side, path: String, mut entries: Vec<FileEntry>) {
+    /// A remote listing arrived: filter dotfiles like the local pane does and
+    /// show it. One for a pane that has since gone back to this computer is
+    /// stale and must not replace the local listing.
+    fn on_listing(&mut self, side: Side, path: String, entries: Vec<FileEntry>) {
         if !self.side_is_remote(side) {
             return;
         }
+        let mut entries = localfs::filter_hidden(entries, self.store.settings.show_hidden);
         let pane = self.side_pane_mut(side);
         pane.cwd = path;
         std::mem::swap(&mut pane.entries, &mut entries);
@@ -417,6 +432,7 @@ impl FerropipeApp {
     /// A worker error: clear the side's busy flags and, when a connect was in
     /// flight, remember the failure for the sidebar's red dot.
     fn on_error(&mut self, ctx: &egui::Context, side: Side, msg: String) {
+        diag_error!("session", "{side:?} pane: {msg}");
         let failed = self.pending_host(side);
         if side == Side::Left {
             self.lconnecting = false;
@@ -443,6 +459,8 @@ impl FerropipeApp {
         if !self.side_is_remote(side) || self.side_connecting(side) {
             return;
         }
+        let name = self.side_name(side);
+        diag_info!("session", "{name} disconnected ({side:?} pane)");
         if side == Side::Left {
             self.revert_left_to_local();
             return;
@@ -457,6 +475,12 @@ impl FerropipeApp {
             Side::Left => self.lconnected,
             Side::Right => self.connected,
         }
+    }
+
+    /// The name of the host connected on `side`, for log lines.
+    fn side_name(&self, side: Side) -> String {
+        self.side_host(side)
+            .map_or_else(|| "remote".to_string(), |id| self.conn_name(id))
     }
 
     /// The host whose connect is still in flight on `side`, if any.
@@ -550,5 +574,43 @@ mod tests {
         assert!(!pane_is_remote(Side::Right, true, true));
         assert!(!pane_is_remote(Side::Left, false, false));
         assert!(pane_is_remote(Side::Right, false, false));
+    }
+
+    // -- connect_line ------------------------------------------------------
+
+    /// A password-auth SMB host whose encrypted blob and notes carry `marker`.
+    fn password_conn(marker: &str) -> Connection {
+        Connection {
+            id: Uuid::new_v4(),
+            name: "nas".into(),
+            host: "nas.local".into(),
+            port: 445,
+            username: "admin".into(),
+            auth: AuthMethod::Password {
+                password_enc: marker.into(),
+            },
+            kind: ConnectionKind::Smb,
+            domain: String::new(),
+            insecure_tls: false,
+            group: String::new(),
+            color: None,
+            notes: format!("note {marker}"),
+        }
+    }
+
+    #[test]
+    fn connect_line_names_the_host_kind_and_target() {
+        let line = connect_line(&password_conn("x"));
+        assert_eq!(line, "nas (SMB) -> admin@nas.local:445");
+    }
+
+    #[test]
+    fn connect_line_never_carries_the_password_blob_or_notes() {
+        // Arrange
+        let marker = "MARKER-SECRET-7f3a";
+        // Act
+        let line = connect_line(&password_conn(marker));
+        // Assert
+        assert!(!line.contains(marker), "secret leaked into: {line}");
     }
 }

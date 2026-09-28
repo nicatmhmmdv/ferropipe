@@ -28,7 +28,9 @@ pub use host::{
 };
 pub use misc::{dashed_outline, empty_pane, icon_button, primary_button, section_label, toast};
 pub use path::{PathAction, path_bar};
-pub use transfer::{TransferAction, TransferPhase, TransferView, gutter_arrow, transfer_row};
+pub use transfer::{
+    Direction, TransferAction, TransferPhase, TransferView, gutter_arrow, transfer_row,
+};
 
 // ---------------------------------------------------------------------------
 // Pure helpers

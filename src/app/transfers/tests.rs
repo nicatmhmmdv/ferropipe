@@ -51,6 +51,15 @@ fn transfer_verb_is_copy_when_both_panes_share_a_mode() {
     assert_eq!(transfer_verb(false, false), Verb::Copy);
 }
 
+// -- direction_of ------------------------------------------------------
+
+#[test]
+fn direction_of_maps_each_verb_to_its_drawer_direction() {
+    assert_eq!(direction_of(Verb::Upload), Direction::Upload);
+    assert_eq!(direction_of(Verb::Download), Direction::Download);
+    assert_eq!(direction_of(Verb::Copy), Direction::Copy);
+}
+
 // -- transfer_label ----------------------------------------------------
 
 #[test]

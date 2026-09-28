@@ -1,7 +1,7 @@
 //! Ferropipe GUI: connection sidebar + dual-pane SFTP file manager.
 use crate::localfs;
 use crate::model::{AuthMethod, Connection, ConnectionKind, FileEntry};
-use crate::remote::{self, Command, Event, WorkerHandle};
+use crate::remote::{self, Command, Event, OnConflict, WorkerHandle};
 use crate::store::Store;
 use crate::vault::Vault;
 use eframe::egui;
@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use uuid::Uuid;
 
 mod chrome;
+mod conflicts;
 mod console;
 mod dialogs;
 mod editor;
@@ -26,6 +27,7 @@ mod ssh_panel;
 mod transfers;
 
 use chrome::Toast;
+use conflicts::ConflictPrompt;
 use dialogs::{Prompt, PromptKind};
 use editor::ConnEditor;
 use live_edit::EditWatch;
@@ -191,8 +193,9 @@ pub struct FerropipeApp {
     right_saved_cwd: String,
     /// Remote→remote staging: source-download id → job describing the follow-up upload.
     stage_download: HashMap<u64, StageJob>,
-    /// Upload id → temp dir to clean up once the staged upload completes.
-    stage_cleanup: HashMap<u64, PathBuf>,
+    /// Upload id → its staging job, kept so the leg can be re-issued after a
+    /// conflict prompt and its temp dir cleaned up once it completes.
+    stage_cleanup: HashMap<u64, StageJob>,
     /// Most recent transfer error per worker `(time, message)`, indexed by `Side`;
     /// attached to the `TransferDone { ok: false }` that follows it.
     last_transfer_error: [Option<(f64, String)>; 2],
@@ -208,6 +211,8 @@ pub struct FerropipeApp {
     editor: Option<ConnEditor>,
     prompt: Option<Prompt>,
     confirm_delete: Option<(Side, Vec<String>)>,
+    /// The "N files already exist" prompt a stopped transfer is waiting on.
+    conflict_prompt: Option<ConflictPrompt>,
 
     toasts: Vec<Toast>,
     search: String,
@@ -319,6 +324,7 @@ impl FerropipeApp {
             editor: None,
             prompt: None,
             confirm_delete: None,
+            conflict_prompt: None,
             toasts: Vec::new(),
             search: String::new(),
             selected_conn: None,
@@ -476,8 +482,11 @@ impl Drop for FerropipeApp {
         for (_, job) in self.stage_download.drain() {
             let _ = std::fs::remove_dir_all(&job.temp_dir);
         }
-        for (_, temp) in self.stage_cleanup.drain() {
-            let _ = std::fs::remove_dir_all(&temp);
+        for (_, job) in self.stage_cleanup.drain() {
+            let _ = std::fs::remove_dir_all(&job.temp_dir);
+        }
+        if let Some(prompt) = self.conflict_prompt.take() {
+            prompt.discard();
         }
         for w in self.edits.drain(..) {
             if let Some(parent) = w.temp_file.parent() {

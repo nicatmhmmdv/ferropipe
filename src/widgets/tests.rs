@@ -262,3 +262,19 @@ fn pulse_alpha_stays_within_the_configured_band() {
         assert!((0.35..=1.0).contains(&a), "t={t} a={a}");
     }
 }
+
+// -- Direction ---------------------------------------------------------
+
+#[test]
+fn direction_glyphs_are_up_down_and_across() {
+    assert_eq!(Direction::Upload.glyph(), "↑");
+    assert_eq!(Direction::Download.glyph(), "↓");
+    assert_eq!(Direction::Copy.glyph(), "⇉");
+}
+
+#[test]
+fn direction_joiner_points_at_the_destination_except_for_downloads() {
+    assert_eq!(Direction::Upload.joiner(), "→");
+    assert_eq!(Direction::Copy.joiner(), "→");
+    assert_eq!(Direction::Download.joiner(), "←");
+}

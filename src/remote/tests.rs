@@ -1,5 +1,7 @@
 //! Unit tests for the worker's pure helpers and the local → local copy.
 
+use super::conflicts::{Existing, find_conflicts, refuse_mismatches, renamed_name};
+use super::transfer::{TransferPlan, copy_target, part_path, plan_local_copy};
 use super::*;
 
 #[test]
@@ -177,6 +179,7 @@ fn copy_local_copies_a_file_and_a_nested_directory_through_an_idle_worker() {
         id: 7,
         paths: vec![src.join("f.txt"), src.join("d")],
         dest_dir: dest.clone(),
+        on_conflict: OnConflict::Ask,
     };
     // Act
     let events = run_idle_worker(cmd);
@@ -203,6 +206,7 @@ fn copy_local_refuses_a_directory_into_itself_and_reports_the_failure() {
         id: 3,
         paths: vec![src.join("d")],
         dest_dir: src.join("d"),
+        on_conflict: OnConflict::Ask,
     };
     // Act
     let events = run_idle_worker(cmd);
@@ -227,6 +231,7 @@ fn copy_local_keeps_the_sources_permission_bits() {
         id: 1,
         paths: vec![script],
         dest_dir: dest.clone(),
+        on_conflict: OnConflict::Ask,
     });
     assert!(matches!(
         events.last(),
@@ -237,4 +242,245 @@ fn copy_local_keeps_the_sources_permission_bits() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o755);
+}
+
+// -- renamed_name -------------------------------------------------------
+
+#[test]
+fn renamed_name_inserts_a_counter_before_the_extension() {
+    // Arrange
+    let taken = |_: &str| false;
+    // Act
+    let name = renamed_name("report.pdf", taken);
+    // Assert
+    assert_eq!(name, "report (1).pdf");
+}
+
+#[test]
+fn renamed_name_skips_taken_candidates() {
+    let taken = |n: &str| n == "report (1).pdf" || n == "report (2).pdf";
+    assert_eq!(renamed_name("report.pdf", taken), "report (3).pdf");
+}
+
+#[test]
+fn renamed_name_splits_at_the_last_dot_only() {
+    assert_eq!(
+        renamed_name("archive.tar.gz", |_| false),
+        "archive.tar (1).gz"
+    );
+}
+
+#[test]
+fn renamed_name_without_an_extension_appends_the_counter() {
+    assert_eq!(renamed_name("Makefile", |_| false), "Makefile (1)");
+    // A leading dot is not an extension separator.
+    assert_eq!(renamed_name(".bashrc", |_| false), ".bashrc (1)");
+}
+
+#[test]
+fn renamed_name_increments_an_existing_counter() {
+    assert_eq!(renamed_name("report (1).pdf", |_| false), "report (2).pdf");
+    assert_eq!(renamed_name("notes (7)", |_| false), "notes (8)");
+    // Only a " (N)" suffix counts as a counter.
+    assert_eq!(renamed_name("a (b).txt", |_| false), "a (b) (1).txt");
+}
+
+// -- find_conflicts / refuse_mismatches ----------------------------------
+
+/// A destination tree for the pre-pass: path → what is there.
+fn tree(entries: &[(&str, Existing)]) -> impl Fn(&String) -> Existing {
+    let map: std::collections::HashMap<String, Existing> =
+        entries.iter().map(|(p, e)| (p.to_string(), *e)).collect();
+    move |p: &String| map.get(p).copied().unwrap_or(Existing::Missing)
+}
+
+// Mirrors the `&dyn Fn(&String) -> String` the pre-pass takes for `D = String`.
+#[allow(clippy::ptr_arg)]
+fn rel(p: &String) -> String {
+    p.trim_start_matches("/dest/").to_string()
+}
+
+fn plan(dirs: &[&str], files: &[(&str, u64)]) -> TransferPlan<(), String> {
+    TransferPlan {
+        dirs: dirs.iter().map(|d| d.to_string()).collect(),
+        files: files.iter().map(|(f, s)| ((), f.to_string(), *s)).collect(),
+    }
+}
+
+#[test]
+fn find_conflicts_is_empty_when_nothing_exists_at_the_destinations() {
+    // Arrange
+    let plan = plan(&["/dest/d"], &[("/dest/f.txt", 5), ("/dest/d/g.txt", 6)]);
+    let probe = tree(&[]);
+    // Act
+    let conflicts = find_conflicts(&plan, &rel, &probe);
+    // Assert
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn find_conflicts_reports_an_existing_file_with_both_sizes() {
+    let plan = plan(&[], &[("/dest/f.txt", 5), ("/dest/d/g.txt", 6)]);
+    let probe = tree(&[("/dest/d/g.txt", Existing::File { size: 1200 })]);
+    let conflicts = find_conflicts(&plan, &rel, &probe);
+    assert_eq!(
+        conflicts,
+        vec![Conflict {
+            name: "d/g.txt".into(),
+            existing_size: 1200,
+            incoming_size: 6,
+            kind_mismatch: false,
+        }]
+    );
+}
+
+#[test]
+fn find_conflicts_merges_into_an_existing_directory_without_complaint() {
+    let plan = plan(&["/dest/d", "/dest/d/e"], &[]);
+    let probe = tree(&[("/dest/d", Existing::Dir), ("/dest/d/e", Existing::Dir)]);
+    assert!(find_conflicts(&plan, &rel, &probe).is_empty());
+}
+
+#[test]
+fn find_conflicts_flags_a_file_where_a_directory_should_go() {
+    let plan = plan(&["/dest/d"], &[]);
+    let probe = tree(&[("/dest/d", Existing::File { size: 9 })]);
+    assert_eq!(
+        find_conflicts(&plan, &rel, &probe),
+        vec![Conflict {
+            name: "d".into(),
+            existing_size: 9,
+            incoming_size: 0,
+            kind_mismatch: true,
+        }]
+    );
+}
+
+#[test]
+fn find_conflicts_flags_a_directory_where_a_file_should_go() {
+    let plan = plan(&[], &[("/dest/f.txt", 5)]);
+    let probe = tree(&[("/dest/f.txt", Existing::Dir)]);
+    assert_eq!(
+        find_conflicts(&plan, &rel, &probe),
+        vec![Conflict {
+            name: "f.txt".into(),
+            existing_size: 0,
+            incoming_size: 5,
+            kind_mismatch: true,
+        }]
+    );
+}
+
+#[test]
+fn refuse_mismatches_allows_same_kind_collisions() {
+    let plan = plan(&["/dest/d"], &[("/dest/f.txt", 5)]);
+    let probe = tree(&[
+        ("/dest/d", Existing::Dir),
+        ("/dest/f.txt", Existing::File { size: 1 }),
+    ]);
+    assert!(refuse_mismatches(&plan, &rel, &probe).is_ok());
+}
+
+#[test]
+fn refuse_mismatches_names_what_is_in_the_way() {
+    let plan = plan(&["/dest/d"], &[("/dest/f.txt", 5)]);
+    let dir_in_the_way = tree(&[("/dest/f.txt", Existing::Dir)]);
+    let err = refuse_mismatches(&plan, &rel, &dir_in_the_way).unwrap_err();
+    assert_eq!(err.to_string(), "f.txt: a directory is in the way");
+    let file_in_the_way = tree(&[("/dest/d", Existing::File { size: 2 })]);
+    let err = refuse_mismatches(&plan, &rel, &file_in_the_way).unwrap_err();
+    assert_eq!(err.to_string(), "d: a file is in the way");
+}
+
+// -- CopyLocal conflict policies through the worker ---------------------
+
+/// The fixture plus an older `dest/f.txt` holding "old".
+fn conflict_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (tmp, src, dest) = copy_fixture();
+    write(&dest.join("f.txt"), b"old");
+    (tmp, src, dest)
+}
+
+fn copy_f(src: &Path, dest: &Path, on_conflict: OnConflict) -> Command {
+    Command::CopyLocal {
+        id: 9,
+        paths: vec![src.join("f.txt")],
+        dest_dir: dest.to_path_buf(),
+        on_conflict,
+    }
+}
+
+#[test]
+fn copy_local_asks_before_overwriting_and_leaves_the_destination_alone() {
+    // Arrange
+    let (_tmp, src, dest) = conflict_fixture();
+    // Act
+    let events = run_idle_worker(copy_f(&src, &dest, OnConflict::Ask));
+    // Assert: one Conflicts event, no TransferDone, bytes untouched
+    assert!(
+        matches!(
+            &events[..],
+            [Event::Conflicts { id: 9, conflicts }]
+                if conflicts.len() == 1
+                    && conflicts[0].name == "f.txt"
+                    && conflicts[0].existing_size == 3
+                    && conflicts[0].incoming_size == 5
+                    && !conflicts[0].kind_mismatch
+        ),
+        "{events:?}"
+    );
+    assert_eq!(std::fs::read(dest.join("f.txt")).unwrap(), b"old");
+    assert!(!dest.join("f.txt.ferropipe-part").exists());
+}
+
+#[test]
+fn copy_local_skip_leaves_the_existing_file_and_still_finishes() {
+    let (_tmp, src, dest) = conflict_fixture();
+    let events = run_idle_worker(copy_f(&src, &dest, OnConflict::Skip));
+    assert_eq!(std::fs::read(dest.join("f.txt")).unwrap(), b"old");
+    assert!(matches!(
+        events.last(),
+        Some(Event::TransferDone { id: 9, ok: true })
+    ));
+    let p = last_progress(&events);
+    assert_eq!((p.bytes_done, p.bytes_total), (5, 5));
+}
+
+#[test]
+fn copy_local_overwrite_replaces_the_existing_file() {
+    let (_tmp, src, dest) = conflict_fixture();
+    let events = run_idle_worker(copy_f(&src, &dest, OnConflict::Overwrite));
+    assert_eq!(std::fs::read(dest.join("f.txt")).unwrap(), b"hello");
+    assert!(matches!(
+        events.last(),
+        Some(Event::TransferDone { id: 9, ok: true })
+    ));
+}
+
+#[test]
+fn copy_local_rename_keeps_both_files() {
+    let (_tmp, src, dest) = conflict_fixture();
+    let events = run_idle_worker(copy_f(&src, &dest, OnConflict::Rename));
+    assert_eq!(std::fs::read(dest.join("f.txt")).unwrap(), b"old");
+    assert_eq!(std::fs::read(dest.join("f (1).txt")).unwrap(), b"hello");
+    assert!(matches!(
+        events.last(),
+        Some(Event::TransferDone { id: 9, ok: true })
+    ));
+}
+
+#[test]
+fn copy_local_overwrite_refuses_a_directory_in_the_way_before_writing() {
+    let (_tmp, src, dest) = copy_fixture();
+    std::fs::create_dir(dest.join("f.txt")).unwrap();
+    let events = run_idle_worker(copy_f(&src, &dest, OnConflict::Overwrite));
+    assert!(
+        matches!(
+            &events[..],
+            [Event::Error { context, message }, Event::TransferDone { id: 9, ok: false }]
+                if context == "copy" && message.contains("f.txt: a directory is in the way")
+        ),
+        "{events:?}"
+    );
+    assert!(dest.join("f.txt").is_dir());
 }

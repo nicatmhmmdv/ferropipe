@@ -60,6 +60,7 @@ impl FerropipeApp {
         self.editor.is_some()
             || self.prompt.is_some()
             || self.confirm_delete.is_some()
+            || self.conflict_prompt.is_some()
             || self.ssh_panel.is_some()
     }
 

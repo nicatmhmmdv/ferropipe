@@ -21,10 +21,38 @@ pub enum TransferPhase {
     Failed,
 }
 
+/// Which way a transfer moves, for the drawer's glyphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Upload,
+    Download,
+    Copy,
+}
+
+impl Direction {
+    /// The row's leading glyph: up to a host, down from one, across otherwise.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Direction::Upload => "↑",
+            Direction::Download => "↓",
+            Direction::Copy => "⇉",
+        }
+    }
+
+    /// The arrow between the label and its destination; a download reads
+    /// right to left, everything else lands in the destination.
+    pub(super) fn joiner(self) -> &'static str {
+        match self {
+            Direction::Download => "←",
+            Direction::Upload | Direction::Copy => "→",
+        }
+    }
+}
+
 /// Everything `transfer_row` needs to draw one transfer.
 #[derive(Clone, Copy, Debug)]
 pub struct TransferView<'a> {
-    pub upload: bool,
+    pub direction: Direction,
     pub label: &'a str,
     pub dest: &'a str,
     /// Progress in `0.0..=1.0`.
@@ -47,7 +75,7 @@ pub fn transfer_row(ui: &mut Ui, view: &TransferView) -> Option<TransferAction> 
     ui.horizontal(|ui| {
         ui.set_min_height(24.0);
         ui.spacing_mut().item_spacing.x = 8.0;
-        let arrow = if view.upload { "↑" } else { "↓" };
+        let arrow = view.direction.glyph();
         ui.add_sized(
             vec2(14.0, 24.0),
             Label::new(mono(arrow, 13.0, p.text2)).selectable(false),
@@ -119,7 +147,7 @@ fn transfer_label(ui: &mut Ui, view: &TransferView) {
             ..Default::default()
         },
     );
-    let dir = if view.upload { "→" } else { "←" };
+    let dir = view.direction.joiner();
     job.append(
         &format!(" {dir} {}", view.dest),
         0.0,
