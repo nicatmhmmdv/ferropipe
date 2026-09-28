@@ -186,8 +186,8 @@ impl FerropipeApp {
 }
 
 impl FerropipeApp {
-    /// Logo and wordmark on the left; theme, console, hidden-files and
-    /// function-key-bar toggles on the right.
+    /// Logo and wordmark on the left; theme, console, hidden-files,
+    /// function-key-bar and reopen-on-start toggles on the right.
     pub(super) fn render_top_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(2.0);
@@ -241,6 +241,15 @@ impl FerropipeApp {
             .clicked()
         {
             self.store.settings.show_fkeys = !keys;
+            self.save_store();
+        }
+        let reopen = self.store.settings.restore_session;
+        if ui
+            .selectable_label(reopen, "Reopen")
+            .on_hover_text("Reopen the last hosts in their panes on start")
+            .clicked()
+        {
+            self.store.settings.restore_session = !reopen;
             self.save_store();
         }
     }

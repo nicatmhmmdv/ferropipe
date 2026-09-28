@@ -1,4 +1,5 @@
 //! Ferropipe GUI: connection sidebar + dual-pane SFTP file manager.
+use crate::diag::diag_error;
 use crate::localfs;
 use crate::model::{AuthMethod, Connection, ConnectionKind, FileEntry};
 use crate::remote::{self, Command, Event, OnConflict, WorkerHandle};
@@ -21,6 +22,7 @@ mod live_edit;
 mod local_copy;
 mod pane_actions;
 mod panes;
+mod persist;
 mod session;
 mod sidebar;
 mod ssh_panel;
@@ -34,22 +36,7 @@ use live_edit::EditWatch;
 use ssh_panel::SshPanel;
 use transfers::{NewTransfer, StageJob, TransferState};
 
-/// Which pane a drag/action came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    Left,
-    Right,
-}
-
-impl Side {
-    /// The opposite pane.
-    pub fn other(self) -> Side {
-        match self {
-            Side::Left => Side::Right,
-            Side::Right => Side::Left,
-        }
-    }
-}
+pub use crate::model::Side;
 
 /// Payload carried during a drag-and-drop between panes.
 #[derive(Clone)]
@@ -163,6 +150,14 @@ pub struct FerropipeApp {
     store: Store,
     vault: Vault,
     store_path: PathBuf,
+    /// Settings changed since the last write; flushed by `tick` (debounced)
+    /// and finally by `Drop`.
+    store_dirty: bool,
+    /// When the last debounced write happened, in `egui` time.
+    last_store_save: f64,
+    /// Per `Side`: the first listing after connect is of a remembered
+    /// directory, so a failure falls back to home once.
+    restoring: [bool; 2],
     worker: WorkerHandle,
     worker_join: Option<std::thread::JoinHandle<()>>,
     events: mpsc::Receiver<Event>,
@@ -259,13 +254,11 @@ fn spawn_worker(ctx: &egui::Context) -> Worker {
     }
 }
 
-/// The local pane, opened at the last-used directory (or home) and listed.
+/// The local pane, opened at the directory the left pane last showed (while
+/// it still exists, else home) and listed.
 fn local_pane(store: &Store) -> PaneState {
-    let start = store
-        .settings
-        .last_local_dir
-        .clone()
-        .unwrap_or_else(local_home);
+    let remembered = store.settings.remembered_dir(None, Side::Left);
+    let start = persist::existing_dir(remembered).unwrap_or_else(local_home);
     let mut local = PaneState::new(false, start);
     reload_local(&mut local, store.settings.show_hidden);
     local
@@ -284,17 +277,24 @@ impl FerropipeApp {
         // The right pane's worker, then a second one that backs the left pane
         // when it hosts a remote (remote-to-remote).
         let workers = [spawn_worker(&cc.egui_ctx), spawn_worker(&cc.egui_ctx)];
-        Self::assemble(store, vault, store_path, workers)
+        let mut app = Self::assemble(store, vault, store_path, workers);
+        app.restore_panes(&cc.egui_ctx);
+        app
     }
 
     /// Every field's starting value: the given parts, everything else idle or empty.
     fn assemble(store: Store, vault: Vault, store_path: PathBuf, workers: [Worker; 2]) -> Self {
         let [right, left] = workers;
+        let [left_saved_cwd, right_saved_cwd] =
+            [Side::Left, Side::Right].map(|side| persist::saved_local_dir(&store.settings, side));
         FerropipeApp {
             local: local_pane(&store), // reads `store` before it moves in below
             store,
             vault,
             store_path,
+            store_dirty: false,
+            last_store_save: 0.0,
+            restoring: [false, false],
             worker: right.handle,
             worker_join: Some(right.join),
             events: right.events,
@@ -311,9 +311,9 @@ impl FerropipeApp {
             lconnecting: false,
             lpending: None,
             lkind: "",
-            left_saved_cwd: String::new(),
+            left_saved_cwd,
             right_local: false,
-            right_saved_cwd: String::new(),
+            right_saved_cwd,
             stage_download: HashMap::new(),
             stage_cleanup: HashMap::new(),
             last_transfer_error: [None, None],
@@ -352,8 +352,17 @@ impl FerropipeApp {
             .unwrap_or_else(|| "Remote".into())
     }
 
+    /// Write the store now, first forgetting what it remembers about hosts
+    /// that no longer exist. Clears the debounce's dirty flag.
     fn save_store(&mut self) {
+        self.store.prune_forgotten_hosts();
+        self.store_dirty = false;
         if let Err(e) = self.store.save(&self.store_path) {
+            diag_error!(
+                "store",
+                "could not save {}: {e:#}",
+                self.store_path.display()
+            );
             self.status = format!("save failed: {e:#}");
         }
     }
@@ -439,8 +448,10 @@ impl FerropipeApp {
             });
     }
 
-    /// Per-frame housekeeping: poll live edits and keep animating while busy.
+    /// Per-frame housekeeping: flush remembered directories, poll live edits
+    /// and keep animating while busy.
     fn tick(&mut self, ctx: &egui::Context) {
+        self.flush_store_if_due(ctx);
         // Poll edited files for changes (auto re-upload on save).
         if !self.edits.is_empty() {
             let now = ctx.input(|i| i.time);
@@ -467,10 +478,9 @@ impl Drop for FerropipeApp {
     fn drop(&mut self) {
         self.worker.send(Command::Shutdown);
         self.lworker.send(Command::Shutdown);
-        if !self.left_remote {
-            self.store.settings.last_local_dir = Some(self.local.cwd.clone());
-        }
-        let _ = self.store.save(&self.store_path);
+        // Directories and pane hosts are remembered as they change; this
+        // writes whatever the debounce still holds.
+        self.save_store();
         // Let both workers finish any in-flight transfer and exit cleanly.
         if let Some(join) = self.worker_join.take() {
             let _ = join.join();

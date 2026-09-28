@@ -69,6 +69,24 @@ impl ConnectionKind {
     }
 }
 
+/// One of the two file panes; also which pane a drag/action came from.
+/// `side as usize` indexes per-pane arrays (left 0, right 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+impl Side {
+    /// The opposite pane.
+    pub fn other(self) -> Side {
+        match self {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        }
+    }
+}
+
 /// A single connection definition (SSH/SFTP or RDP).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {

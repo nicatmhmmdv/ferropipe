@@ -169,6 +169,7 @@ impl FerropipeApp {
         self.worker.send(Command::Disconnect);
         self.clear_right_session();
         self.status = String::new();
+        self.sync_pane_hosts();
     }
 
     /// Forget the right pane's session state; the worker is told separately.
@@ -177,6 +178,7 @@ impl FerropipeApp {
         self.connected_at = None;
         self.connecting = false;
         self.pending_connect = None;
+        self.restoring[Side::Right as usize] = false;
         self.remote.entries.clear();
         self.remote.selected.clear();
         self.remote.cwd = "/".into();
@@ -213,16 +215,10 @@ impl FerropipeApp {
         self.right_local = true;
         self.remote.remote = false;
         self.remote.loading = false;
-        self.remote.entries.clear();
-        self.remote.selected.clear();
-        self.remote.cwd = if self.right_saved_cwd.is_empty() {
-            local_home()
-        } else {
-            self.right_saved_cwd.clone()
-        };
         self.remote.home = Some(local_home());
-        let show_hidden = self.store.settings.show_hidden;
-        reload_local(&mut self.remote, show_hidden);
+        let cwd = saved_or_home(&self.right_saved_cwd);
+        self.set_local_cwd(Side::Right, cwd);
+        self.sync_pane_hosts();
     }
 
     /// Put the left pane back on the local filesystem, dropping its remote session.
@@ -230,6 +226,7 @@ impl FerropipeApp {
         if self.left_remote || self.lconnecting {
             self.lworker.send(Command::Disconnect);
             self.revert_left_to_local(); // revert immediately, don't wait for the event
+            self.sync_pane_hosts();
         }
     }
 
@@ -305,18 +302,12 @@ impl FerropipeApp {
         self.left_remote = false;
         self.lconnected = None;
         self.lconnecting = false;
+        self.restoring[Side::Left as usize] = false;
         self.local.remote = false;
         self.local.loading = false;
-        self.local.entries.clear();
-        self.local.selected.clear();
-        self.local.cwd = if self.left_saved_cwd.is_empty() {
-            local_home()
-        } else {
-            self.left_saved_cwd.clone()
-        };
         self.local.home = Some(local_home());
-        let show_hidden = self.store.settings.show_hidden;
-        reload_local(&mut self.local, show_hidden);
+        let cwd = saved_or_home(&self.left_saved_cwd);
+        self.set_local_cwd(Side::Left, cwd);
     }
 
     pub(super) fn drain_events(&mut self, ctx: &egui::Context) {
@@ -369,7 +360,8 @@ impl FerropipeApp {
         }
     }
 
-    /// A session came up: remember its home, clear any stale failure and list it.
+    /// A session came up: remember its home, clear any stale failure and
+    /// list the directory the host was last in (or home).
     fn on_connected(&mut self, ctx: &egui::Context, side: Side, home: String, kind: &'static str) {
         // The pane was put back on this computer while this connect was in
         // flight; its Disconnect is already queued behind it.
@@ -397,16 +389,18 @@ impl FerropipeApp {
         }
         let name = self.side_name(side);
         diag_info!("connect", "{name} connected ({kind}), home {home}");
-        self.side_send(side, Command::ListRemote { path: home });
+        self.sync_pane_hosts();
+        self.list_first_dir(side, home);
     }
 
-    /// A remote listing arrived: filter dotfiles like the local pane does and
-    /// show it. One for a pane that has since gone back to this computer is
-    /// stale and must not replace the local listing.
+    /// A remote listing arrived: remember where the host is, filter dotfiles
+    /// like the local pane does and show it. One for a pane that has since
+    /// gone back to this computer is stale and must not replace the local listing.
     fn on_listing(&mut self, side: Side, path: String, entries: Vec<FileEntry>) {
         if !self.side_is_remote(side) {
             return;
         }
+        self.remember_remote_dir(side, &path);
         let mut entries = localfs::filter_hidden(entries, self.store.settings.show_hidden);
         let pane = self.side_pane_mut(side);
         pane.cwd = path;
@@ -430,8 +424,12 @@ impl FerropipeApp {
     }
 
     /// A worker error: clear the side's busy flags and, when a connect was in
-    /// flight, remember the failure for the sidebar's red dot.
+    /// flight, remember the failure for the sidebar's red dot. A failed
+    /// listing of a restored directory just falls back to home instead.
     fn on_error(&mut self, ctx: &egui::Context, side: Side, msg: String) {
+        if self.fall_back_to_home(side, &msg) {
+            return;
+        }
         diag_error!("session", "{side:?} pane: {msg}");
         let failed = self.pending_host(side);
         if side == Side::Left {
@@ -463,10 +461,11 @@ impl FerropipeApp {
         diag_info!("session", "{name} disconnected ({side:?} pane)");
         if side == Side::Left {
             self.revert_left_to_local();
-            return;
+        } else {
+            self.clear_right_session();
+            self.status = "Disconnected".into();
         }
-        self.clear_right_session();
-        self.status = "Disconnected".into();
+        self.sync_pane_hosts();
     }
 
     /// The host connected on `side`, if any.
@@ -478,7 +477,7 @@ impl FerropipeApp {
     }
 
     /// The name of the host connected on `side`, for log lines.
-    fn side_name(&self, side: Side) -> String {
+    pub(super) fn side_name(&self, side: Side) -> String {
         self.side_host(side)
             .map_or_else(|| "remote".to_string(), |id| self.conn_name(id))
     }
@@ -542,10 +541,17 @@ impl FerropipeApp {
             self.side_pane_mut(side).loading = true;
             self.side_send(side, Command::ListRemote { path });
         } else {
-            self.side_pane_mut(side).cwd = path;
-            let show_hidden = self.store.settings.show_hidden;
-            reload_local(self.side_pane_mut(side), show_hidden);
+            self.set_local_cwd(side, path);
         }
+    }
+}
+
+/// The local directory a pane returns to: `saved`, or home when none was kept.
+fn saved_or_home(saved: &str) -> String {
+    if saved.is_empty() {
+        local_home()
+    } else {
+        saved.to_string()
     }
 }
 

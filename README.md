@@ -22,7 +22,8 @@ RDP — with a **dual-pane file browser**, drag-and-drop transfer (including
   - **RDP** — launched via **Remmina** with a tuned profile (GFX AVC444 codec + network
     autodetect for a responsive session). The experimental **native client** (`RDP (Native)`)
     now has a real keyboard: physical-key scancodes (modifiers, arrows, F-keys, AltGr on
-    non-US layouts) plus a Ctrl+Alt+Del button in the window strip.
+    non-US layouts) plus a Ctrl+Alt+Del button in the window strip; the mouse wheel and
+    middle button reach the remote, and the remote pointer shape is drawn under the cursor.
 - Nested **groups** (`WIM/Tovuz`, `Shusha Paid Route/27 KM`), search, add/edit/duplicate/delete.
 - **Import** hosts from `~/.ssh/config`.
 - Auth: password, private-key file (+ passphrase), or ssh-agent.
@@ -37,6 +38,10 @@ RDP — with a **dual-pane file browser**, drag-and-drop transfer (including
 - **Remote-to-remote transfer** — point both panes at hosts and transfer between two
   servers. (Bytes stage through the local machine — true server-to-server isn't possible
   over SFTP/SMB/WinRM; every client relays.)
+- **Nothing is overwritten silently** — when a transfer would replace existing files it
+  stops first and asks: *Keep both* (writes `name (1).ext`), *Skip existing*, *Overwrite*
+  or *Cancel*. Directories merge; a file in the way of a directory is refused up front.
+- **Hidden files** toggle applies to local and remote listings alike.
 - **File ops** on both sides — new folder, new file, rename, delete (with confirm).
 - **Live remote edit** — right-click → *Edit (live)*: downloads the file, opens it in your
   editor, and auto-re-uploads every time you save.
@@ -65,6 +70,13 @@ RDP — with a **dual-pane file browser**, drag-and-drop transfer (including
 - **Function keys**, Commander style — F2 Rename · F4 Edit · F5 Copy · F7 Mkdir ·
   F8 Delete · F9 Console · F10 Hosts · Tab switches pane. They act on the focused pane
   (click a pane to focus it); the legend bar is toggled with "Keys" in the top bar.
+- **Picks up where you left off** — the last directory is remembered per host and per
+  local pane, and the hosts that were open in each pane are reopened on the next start
+  ("Reopen" in the top bar turns that off; directories are remembered either way).
+- **Diagnostics** — connects, disconnects, worker errors and every notification are
+  logged to `~/.local/state/ferropipe/ferropipe.log` (0600, rotated at 1 MiB; never
+  passwords or console command lines). The copy button at the right of the status bar
+  puts the recent log on the clipboard for a bug report.
 
 ## Build & run
 
@@ -117,7 +129,8 @@ All options live in the GUI; you should never hand-edit these.
 ## Architecture
 
 ```
-main.rs        → load store + vault, launch eframe
+main.rs        → load store + vault, start the diagnostics log, launch eframe
+diag.rs        → ring-buffer + file log, "Copy diagnostics" snapshot
 theme.rs       → Foundry palette tokens and the egui Visuals/Style pass
   fonts.rs     → runtime font discovery (optional `bundled-fonts` embedding)
 widgets/       → state-free Foundry widgets
@@ -132,7 +145,9 @@ app.rs         → FerropipeApp: state, worker plumbing, frame loop
   panes.rs     → file panes: host pill, path bar, listing table, drop targets
   pane_actions.rs → dispatch of pane outcomes (open, transfer, rename, …)
   editor.rs    → add / edit connection form
-  transfers.rs → transfer gutter, drawer and bookkeeping (queue, retry, staging)
+  transfers.rs → transfer drawer and bookkeeping (queue, retry); gutter.rs, staged.rs
+  conflicts.rs → the "files already exist" prompt and its re-issue logic
+  local_copy.rs → local → local copies through the idle worker
   fkeys.rs     → function-key handling and the legend bar
   console.rs   → command console
   live_edit.rs → edit-remote-file watcher
@@ -141,7 +156,9 @@ app.rs         → FerropipeApp: state, worker plumbing, frame loop
   chrome.rs    → top bar, status bar and toasts
 native_rdp.rs  → in-app RDP window: framebuffer texture, keyboard bridge, mouse
 remote/        → backend-agnostic worker
-  mod.rs       → RemoteFs trait + generic transfer/walk/delete + command loop
+  mod.rs       → RemoteFs trait, commands/events, command loop
+  transfer.rs  → generic download / upload / local copy with progress
+  conflicts.rs → OnConflict policy, pre-write collision check, "name (1).ext"
   sftp.rs      → SSH connect + host-key verify + SFTP + exec
   smb.rs       → SMB via pavao/libsmbclient
   winrm.rs     → WinRM via winrm-rs (+ PowerShell for dir ops)
