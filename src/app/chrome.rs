@@ -1,6 +1,7 @@
 //! Window chrome: the top bar, the one-line status bar and the toast stack.
 
 use super::*;
+use crate::diag::{self, diag_error, diag_info};
 use crate::theme;
 use crate::widgets;
 use egui::{
@@ -17,6 +18,9 @@ const TOAST_MAX_SHOWN: usize = 5;
 const TOAST_INSET: f32 = 12.0;
 /// Status bar frame margin (x, y).
 const STATUS_MARGIN: (i8, i8) = (10, 4);
+/// The status bar's copy-diagnostics button (egui's icon font has this one).
+const DIAG_GLYPH: &str = "⎘";
+const DIAG_TIP: &str = "Copy diagnostics to the clipboard";
 
 /// One notification.
 pub(super) struct Toast {
@@ -54,6 +58,19 @@ pub(super) fn session_summary(
     }
 }
 
+/// Mirror a toast into the diagnostics log: failures as `Error`, the rest `Info`.
+fn log_toast(msg: &str, detail: Option<&str>, err: bool) {
+    let line = match detail {
+        Some(detail) => format!("{msg} — {detail}"),
+        None => msg.to_string(),
+    };
+    if err {
+        diag_error!("ui", "{line}");
+    } else {
+        diag_info!("ui", "{line}");
+    }
+}
+
 /// 11px monospace text in `color`.
 fn mono(text: &str, color: Color32) -> RichText {
     RichText::new(text)
@@ -85,19 +102,30 @@ impl FerropipeApp {
         err: bool,
     ) {
         let now = ctx.input(|i| i.time);
+        let msg = msg.into();
+        log_toast(&msg, detail.as_deref(), err);
         self.toasts.push(Toast {
-            msg: msg.into(),
+            msg,
             detail,
             expires: now + TOAST_SECS,
             err,
         });
     }
 
-    /// One-line status bar: the session on the left, the latest status message on the right.
+    /// Put the diagnostics snapshot on the clipboard and say where the log file is.
+    fn copy_diagnostics(&mut self, ctx: &egui::Context) {
+        ctx.copy_text(diag::snapshot());
+        let path = diag::log_path().map(|p| p.display().to_string());
+        self.toast_detail(ctx, "Diagnostics copied", path, false);
+    }
+
+    /// One-line status bar: the session on the left, the latest status
+    /// message and the copy-diagnostics button on the right.
     pub(super) fn render_status_bar(&mut self, ctx: &egui::Context, ui: &mut Ui) {
         let p = theme::current(ui);
         let (accent, muted) = self.session_line(ctx.input(|i| i.time));
         let margin = Margin::symmetric(STATUS_MARGIN.0, STATUS_MARGIN.1);
+        let mut copy_clicked = false;
         egui::Panel::bottom("status")
             .resizable(false)
             .show_separator_line(false)
@@ -111,11 +139,16 @@ impl FerropipeApp {
                     }
                     ui.add(Label::new(mono(&muted, p.text3)).selectable(false));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        copy_clicked = widgets::icon_button(ui, DIAG_GLYPH, DIAG_TIP).clicked();
+                        ui.add_space(6.0);
                         let status = Label::new(mono(&self.status, p.text3));
                         ui.add(status.truncate().selectable(false));
                     });
                 });
             });
+        if copy_clicked {
+            self.copy_diagnostics(ctx);
+        }
     }
 
     /// The session summary for the status bar.
@@ -212,9 +245,8 @@ impl FerropipeApp {
         }
     }
 
-    /// Toggle dotfile visibility and relist both panes. Only the local listing
-    /// filters on the flag today (remote listings are not filtered by it yet);
-    /// relisting a remote pane just keeps both sides consistent.
+    /// Toggle dotfile visibility and relist both panes; local listings filter
+    /// as they are read, remote ones as they arrive (`on_listing`).
     fn set_show_hidden(&mut self, hidden: bool) {
         self.store.settings.show_hidden = hidden;
         self.refresh_pane(Side::Left);

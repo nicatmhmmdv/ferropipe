@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod diag;
 mod external;
 mod localfs;
 mod model;
@@ -16,14 +17,18 @@ mod widgets;
 mod winssh;
 
 use anyhow::Context;
+use diag::{diag_info, diag_warn};
 
 fn main() -> eframe::Result<()> {
     let dirs = store::project_dirs().expect("resolve config dir");
+    diag::init(dirs.state_dir().unwrap_or(dirs.data_local_dir()));
+    diag_info!("app", "starting {}", env!("CARGO_PKG_VERSION"));
     let store_path = store::store_path(&dirs);
     let key_path = vault::default_key_path(dirs.config_dir());
 
     let store = store::Store::load(&store_path).unwrap_or_else(|e| {
         eprintln!("warning: could not load store: {e:#}");
+        diag_warn!("store", "could not load {}: {e:#}", store_path.display());
         store::Store::default()
     });
     let vault = vault::Vault::load_or_create(&key_path)

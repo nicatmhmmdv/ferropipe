@@ -13,7 +13,7 @@ pub fn list_dir(path: &Path, show_hidden: bool) -> Result<Vec<FileEntry>> {
             Err(_) => continue,
         };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !show_hidden && name.starts_with('.') {
+        if !show_hidden && is_hidden_name(&name) {
             continue;
         }
         let meta = match entry.metadata() {
@@ -42,6 +42,24 @@ pub fn list_dir(path: &Path, show_hidden: bool) -> Result<Vec<FileEntry>> {
         });
     }
     Ok(out)
+}
+
+/// Whether `name` is a dotfile: it starts with '.' but is neither of the
+/// "." / ".." directory entries.
+pub fn is_hidden_name(name: &str) -> bool {
+    name.starts_with('.') && name != "." && name != ".."
+}
+
+/// `entries` without the dotfiles unless `show_hidden`; order is preserved.
+/// The one filter both the local and the remote listings go through.
+pub fn filter_hidden(entries: Vec<FileEntry>, show_hidden: bool) -> Vec<FileEntry> {
+    if show_hidden {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|e| !is_hidden_name(&e.name))
+        .collect()
 }
 
 pub fn home_dir() -> PathBuf {
@@ -109,5 +127,82 @@ pub fn format_mtime(mtime: Option<u64>) -> String {
             }
         }
         None => "-".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            is_dir: false,
+            size: 0,
+            mtime: None,
+            perm: None,
+            symlink: false,
+        }
+    }
+
+    fn names(entries: &[FileEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    // -- is_hidden_name ----------------------------------------------------
+
+    #[test]
+    fn is_hidden_name_is_true_for_a_dotfile() {
+        assert!(is_hidden_name(".bashrc"));
+        assert!(is_hidden_name(".config"));
+    }
+
+    #[test]
+    fn is_hidden_name_is_false_for_the_dot_directories() {
+        assert!(!is_hidden_name("."));
+        assert!(!is_hidden_name(".."));
+    }
+
+    #[test]
+    fn is_hidden_name_is_false_for_plain_and_empty_names() {
+        assert!(!is_hidden_name("Documents"));
+        assert!(!is_hidden_name("file.txt"));
+        assert!(!is_hidden_name(""));
+    }
+
+    // -- filter_hidden -----------------------------------------------------
+
+    #[test]
+    fn filter_hidden_drops_only_dotfiles_and_keeps_order_when_hidden_is_off() {
+        // Arrange
+        let entries = vec![
+            entry("zeta"),
+            entry(".hidden"),
+            entry("alpha"),
+            entry(".."),
+            entry("."),
+            entry(".git"),
+            entry("beta.txt"),
+        ];
+        // Act
+        let kept = filter_hidden(entries, false);
+        // Assert
+        assert_eq!(names(&kept), vec!["zeta", "alpha", "..", ".", "beta.txt"]);
+    }
+
+    #[test]
+    fn filter_hidden_keeps_everything_when_hidden_is_on() {
+        // Arrange
+        let entries = vec![entry("zeta"), entry(".hidden"), entry("alpha")];
+        // Act
+        let kept = filter_hidden(entries, true);
+        // Assert
+        assert_eq!(names(&kept), vec!["zeta", ".hidden", "alpha"]);
+    }
+
+    #[test]
+    fn filter_hidden_of_nothing_is_nothing() {
+        assert!(filter_hidden(Vec::new(), false).is_empty());
+        assert!(filter_hidden(Vec::new(), true).is_empty());
     }
 }
