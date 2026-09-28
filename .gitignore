@@ -3,3 +3,11 @@
 *.pdb
 # Rendered icon variants (regenerated from assets/ferropipe.svg)
 /assets/ferropipe-*.png
+# makepkg output under packaging/ (sources are cloned next to the PKGBUILD)
+/packaging/src/
+/packaging/pkg/
+/packaging/ferropipe/
+/packaging/ferropipe-rdp/
+/packaging/rdpeudp/
+/packaging/*.pkg.tar.*
+/packaging/*.log

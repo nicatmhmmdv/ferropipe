@@ -79,6 +79,32 @@ Fonts are discovered at runtime (IBM Plex, then Noto Sans / Cantarell / JetBrain
 then DejaVu). To embed IBM Plex in the binary instead, drop the four files listed in
 `assets/fonts/README.md` into `assets/fonts/` and build with `--features bundled-fonts`.
 
+## Install
+
+### Arch Linux
+
+`packaging/PKGBUILD` builds the `ferropipe-git` package from the current `HEAD`,
+cloning `ferropipe-rdp` and `rdpeudp` alongside it (the crate depends on both as
+sibling path dependencies):
+
+```bash
+cd packaging && makepkg -si
+```
+
+It pulls `libssh2`, `openssl` and `smbclient`, and suggests `remmina` (RDP) and
+`alacritty` (default SSH terminal) as optional dependencies. See
+[packaging/README.md](packaging/README.md).
+
+### Any distro, per user
+
+`install.sh` builds a release binary and installs it, the desktop entry and the
+icon under `~/.local` (`PREFIX=...` to change). Clone `rdpeudp`, `ferropipe-rdp`
+and `ferropipe` next to each other first:
+
+```bash
+./install.sh
+```
+
 ## Configuration
 
 Under `~/.config/ferropipe/`:
@@ -135,8 +161,49 @@ Two worker threads (one per pane) own their `RemoteFs` backend and talk to the U
 cargo test
 ```
 
-Covers vault crypto (round-trip / nonce-uniqueness / wrong-key), path helpers, and
-ssh-config parsing.
+Covers vault crypto (round-trip / nonce-uniqueness / wrong-key), path helpers,
+ssh-config parsing and the local copy planner.
+
+### Live probes (opt-in)
+
+Three `#[ignore]`d tests exercise a real backend end to end against a host you
+have already saved in the app. Each reads `~/.config/ferropipe/connections.json`
+and the vault, decrypts the saved secret without printing it, and prints
+numbered steps. They are skipped unless their environment variable names a saved
+connection of the matching kind, so a plain `cargo test` never touches the
+network. Run one with `--ignored --nocapture`:
+
+```bash
+FERROPIPE_SFTP_PROBE='<saved SSH name>'    cargo test sftp::live_probe  -- --ignored --nocapture
+FERROPIPE_SMB_PROBE='<saved SMB name>'     cargo test smb::live_probe   -- --ignored --nocapture
+FERROPIPE_WINRM_PROBE='<saved WinRM name>' cargo test winrm::live_probe -- --ignored --nocapture
+```
+
+What each one does on the host (the scratch file is `ferropipe-probe-<pid>.txt`
+and is removed again, also when an assertion fails halfway):
+
+| Probe | Test | Reads | Writes and removes | Runs |
+| --- | --- | --- | --- | --- |
+| SSH/SFTP | `sftp::live_probe::sftp_round_trip_against_saved_host` | the login user's home directory listing | the scratch file in the home directory, written through `<name>.ferropipe-part` and renamed | `echo ferropipe-probe` |
+| SMB | `smb::live_probe::smb_round_trip_against_saved_host` | the share list, `C$/Windows`, and `C$/Windows/win.ini` (downloaded to a local temp dir) | the scratch file in `C$/Windows/Temp`, written through `<name>.ferropipe-part` and renamed | nothing |
+| WinRM | `winrm::live_probe::winrm_round_trip_against_saved_host` | the profile directory listing (`$env:USERPROFILE`) | the scratch file in the profile directory (`C:\Windows\Temp` if no profile resolved), uploaded directly | `hostname` |
+
+The SSH probe uses the saved auth as-is (password, key file with its passphrase,
+or ssh-agent) and, like the app, records an unknown host key in
+`~/.ssh/known_hosts`. The SMB probe needs an account that can read `C$`; the
+WinRM probe needs WinRM enabled on the host (`:5985`, or `:5986` for TLS).
+
+## CI
+
+`.github/workflows/ci.yml` builds, tests, runs clippy (`-D warnings`) and
+`cargo fmt --check` on every push and pull request, plus an advisory
+`cargo audit` job that does not block merges. Because the crate depends on
+`../ferropipe-rdp` (which depends on `../rdpeudp`), the workflow checks the three
+repositories out side by side (`ferropipe/`, `ferropipe-rdp/`, `rdpeudp/`) and
+runs cargo from `ferropipe/`; `nicatmhmmdv/ferropipe-rdp` and
+`nicatmhmmdv/rdpeudp` therefore have to be published on GitHub for the workflow
+to pass (and, if private, need a read token on their checkout steps).
+`ferropipe-rdp` has the same workflow, checking out `rdpeudp` next to itself.
 
 ## Notes & roadmap
 

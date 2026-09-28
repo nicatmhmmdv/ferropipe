@@ -262,3 +262,66 @@ impl RemoteFs for WinRmFs {
         Ok(out.exit_code)
     }
 }
+
+/// Live probe against a saved WinRM host, opt-in: set `FERROPIPE_WINRM_PROBE`
+/// to the saved connection's name and run
+/// `FERROPIPE_WINRM_PROBE=<name> cargo test winrm::live_probe -- --ignored --nocapture`.
+/// Reads the real store and vault and never prints the password. On the host it
+/// runs `hostname` and writes one scratch file `ferropipe-probe-<pid>.txt` into
+/// the login user's profile directory (`$env:USERPROFILE`, or `C:\Windows\Temp`
+/// when the profile could not be resolved), which it removes again.
+#[cfg(test)]
+mod live_probe {
+    use super::*;
+    use crate::model::ConnectionKind;
+    use crate::remote::smb::probe_support::{exec_stdout, saved_connection, scratch_round_trip};
+
+    /// The backend reports paths forward-slashed and keeps `C:/` as home when
+    /// `$env:USERPROFILE` came back empty; only then fall back to Windows\Temp.
+    fn scratch_dir(home: &str) -> String {
+        let trimmed = home.trim_end_matches('/');
+        if trimmed.is_empty() || trimmed == "C:" {
+            "C:/Windows/Temp".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    #[test]
+    fn scratch_dir_prefers_the_profile_and_falls_back_to_windows_temp() {
+        assert_eq!(scratch_dir("C:/Users/probe"), "C:/Users/probe");
+        assert_eq!(scratch_dir("C:/Users/probe/"), "C:/Users/probe");
+        assert_eq!(scratch_dir("C:/"), "C:/Windows/Temp");
+        assert_eq!(scratch_dir(""), "C:/Windows/Temp");
+    }
+
+    #[test]
+    #[ignore = "needs a saved WinRM host on the network; see the module docs"]
+    fn winrm_round_trip_against_saved_host() {
+        let Ok(name) = std::env::var("FERROPIPE_WINRM_PROBE") else {
+            println!("FERROPIPE_WINRM_PROBE not set; skipping");
+            return;
+        };
+        let (conn, secret) = saved_connection(&name, ConnectionKind::WinRm);
+        println!(
+            "[1] connecting to {}:{} as {} (domain {:?}, tls {})",
+            conn.host,
+            conn.port,
+            conn.username,
+            conn.domain,
+            conn.port == 5986
+        );
+        let fs = WinRmFs::connect(&conn, Some(&secret)).expect("connect");
+        let dir = scratch_dir(&fs.home());
+        let entries = fs.list(&dir).expect("list scratch dir");
+        println!("[2] {dir}: {} entries", entries.len());
+        let (code, lines) = exec_stdout(&fs, "hostname");
+        assert_eq!(code, 0, "hostname exited {code}");
+        assert!(
+            lines.iter().any(|l| !l.trim().is_empty()),
+            "hostname printed nothing"
+        );
+        println!("[3] exec hostname: {lines:?} (exit {code})");
+        scratch_round_trip(&fs, &dir, 4);
+    }
+}

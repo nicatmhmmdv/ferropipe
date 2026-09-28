@@ -225,38 +225,293 @@ impl RemoteFs for SmbFs {
     }
 }
 
-/// Live probe against a saved SMB host, opt-in: set `FERROPIPE_SMB_PROBE` to
-/// the saved connection's name and run
-/// `FERROPIPE_SMB_PROBE=<name> cargo test smb::live_probe -- --ignored --nocapture`.
-/// Reads the real store and vault, never prints the secret, and only writes one
-/// scratch file under `C$/Windows/Temp`, which it removes again.
+/// Shared plumbing for the opt-in live probes in `smb`, `sftp` and `winrm`:
+/// reading a saved connection and its secret out of the real store and vault,
+/// the scratch-file round trip every probe runs, and a guard that removes the
+/// scratch file even when an assertion fails halfway. Test-only; it lives here
+/// so no new `mod` line is needed in `remote/mod.rs`.
 #[cfg(test)]
-mod live_probe {
-    use super::super::{download, upload};
-    use super::*;
-    use crate::model::{AuthMethod, ConnectionKind};
-    use std::path::PathBuf;
+pub(crate) mod probe_support {
+    use super::super::{Event, OnConflict, Outcome, RemoteFs, upload};
+    use crate::model::{AuthMethod, Connection, ConnectionKind};
+    use crate::vault::Vault;
+    use std::cell::RefCell;
 
-    fn saved_smb_connection(name: &str) -> (Connection, String) {
+    const SCRATCH_BODY: &[u8] = b"ferropipe live probe\n";
+
+    /// Load the saved connection called `name` of `kind` from the real store,
+    /// together with its decrypted secret (see [`secret_for`]).
+    pub(crate) fn saved_connection(name: &str, kind: ConnectionKind) -> (Connection, String) {
         let dirs = crate::store::project_dirs().expect("config dir");
         let store = crate::store::Store::load(&crate::store::store_path(&dirs)).expect("store");
         let key = crate::vault::default_key_path(dirs.config_dir());
-        let vault = crate::vault::Vault::load_or_create(&key).expect("vault");
+        let vault = Vault::load_or_create(&key).expect("vault");
         let conn = store
             .connections
             .iter()
-            .find(|c| c.name == name && c.kind == ConnectionKind::Smb)
+            .find(|c| c.name == name && c.kind == kind)
             .cloned()
-            .expect("saved SMB connection with that name");
-        let secret = match &conn.auth {
-            AuthMethod::Password { password_enc } => vault.decrypt(password_enc).expect("decrypt"),
-            _ => String::new(),
-        };
+            .unwrap_or_else(|| panic!("no saved {} connection named {name:?}", kind.label()));
+        let secret = secret_for(&conn.auth, &vault);
         (conn, secret)
     }
 
+    /// The plaintext secret `auth` carries: the password, the key passphrase,
+    /// or "" when there is none (agent auth, unset password, no passphrase).
+    pub(crate) fn secret_for(auth: &AuthMethod, vault: &Vault) -> String {
+        let blob = match auth {
+            AuthMethod::Password { password_enc } => password_enc.as_str(),
+            AuthMethod::Key { passphrase_enc, .. } => passphrase_enc.as_deref().unwrap_or(""),
+            AuthMethod::Agent => "",
+        };
+        if blob.is_empty() {
+            return String::new();
+        }
+        vault.decrypt(blob).expect("decrypt saved secret")
+    }
+
+    /// Short auth label for progress output (never the secret or the key path).
+    pub(crate) fn auth_label(auth: &AuthMethod) -> &'static str {
+        match auth {
+            AuthMethod::Password { .. } => "password",
+            AuthMethod::Key { .. } => "key",
+            AuthMethod::Agent => "agent",
+        }
+    }
+
+    /// Whether `dir` on `fs` currently lists an entry called `name`.
+    pub(crate) fn lists(fs: &dyn RemoteFs, dir: &str, name: &str) -> bool {
+        let entries = fs.list(dir).unwrap_or_else(|e| panic!("list {dir}: {e:#}"));
+        entries.iter().any(|e| e.name == name)
+    }
+
+    /// Run `command` on `fs`; returns its exit code and stdout lines.
+    pub(crate) fn exec_stdout(fs: &dyn RemoteFs, command: &str) -> (i32, Vec<String>) {
+        let lines = RefCell::new(Vec::new());
+        let code = fs
+            .exec(command, &|ev| {
+                if let Event::ExecOutput {
+                    line,
+                    is_err: false,
+                } = ev
+                {
+                    lines.borrow_mut().push(line);
+                }
+            })
+            .unwrap_or_else(|e| panic!("exec {command}: {e:#}"));
+        (code, lines.into_inner())
+    }
+
+    /// A remote scratch file that is removed when dropped, so an assertion
+    /// failing after the upload still cleans up on the host. `remove_now`
+    /// removes it eagerly instead and reports the outcome.
+    pub(crate) struct ScratchFile<'a> {
+        fs: &'a dyn RemoteFs,
+        path: String,
+        armed: bool,
+    }
+
+    impl<'a> ScratchFile<'a> {
+        pub(crate) fn new(fs: &'a dyn RemoteFs, path: String) -> Self {
+            ScratchFile {
+                fs,
+                path,
+                armed: true,
+            }
+        }
+
+        pub(crate) fn remove_now(&mut self) -> anyhow::Result<()> {
+            self.armed = false;
+            self.fs.remove_file(&self.path)
+        }
+    }
+
+    impl Drop for ScratchFile<'_> {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if let Err(e) = self.fs.remove_file(&self.path) {
+                eprintln!("cleanup: could not remove {}: {e:#}", self.path);
+            }
+        }
+    }
+
+    /// Upload `ferropipe-probe-<pid>.txt` into `dir`, check it is listed, read
+    /// it back, remove it and check it is gone, printing steps `first_step` and
+    /// `first_step + 1`. The file is removed even if an assertion fails.
+    pub(crate) fn scratch_round_trip(fs: &dyn RemoteFs, dir: &str, first_step: u32) {
+        let file = format!("ferropipe-probe-{}.txt", std::process::id());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let local = tmp.path().join(&file);
+        std::fs::write(&local, SCRATCH_BODY).expect("write local scratch");
+        let outcome =
+            upload(fs, 1, &[local], dir, OnConflict::Overwrite, &|_ev| {}).expect("upload scratch");
+        assert_eq!(outcome, Outcome::Done, "upload was parked on a conflict");
+        let remote_path = fs.join(dir, &file);
+        let mut scratch = ScratchFile::new(fs, remote_path.clone());
+        assert!(lists(fs, dir, &file), "uploaded {file} not listed in {dir}");
+        let mut back = Vec::new();
+        fs.read_file(&remote_path, &mut back, &mut |_| {})
+            .expect("read back");
+        assert_eq!(back, SCRATCH_BODY, "read back differs from the upload");
+        println!("[{first_step}] uploaded, listed and read back {file}");
+        scratch.remove_now().expect("remove scratch");
+        assert!(!lists(fs, dir, &file), "{file} still listed after removal");
+        println!("[{}] removed {file}", first_step + 1);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::super::RStat;
+        use super::*;
+        use crate::model::FileEntry;
+        use anyhow::Result;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        fn temp_vault() -> (tempfile::TempDir, Vault) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let vault = Vault::load_or_create(&dir.path().join("vault.key")).expect("vault");
+            (dir, vault)
+        }
+
+        #[test]
+        fn secret_for_decrypts_a_saved_password() {
+            let (_dir, vault) = temp_vault();
+            let auth = AuthMethod::Password {
+                password_enc: vault.encrypt("hunter2").expect("encrypt"),
+            };
+            assert_eq!(secret_for(&auth, &vault), "hunter2");
+        }
+
+        #[test]
+        fn secret_for_decrypts_a_key_passphrase() {
+            let (_dir, vault) = temp_vault();
+            let auth = AuthMethod::Key {
+                private_key: "/home/u/.ssh/id_ed25519".into(),
+                passphrase_enc: Some(vault.encrypt("open sesame").expect("encrypt")),
+            };
+            assert_eq!(secret_for(&auth, &vault), "open sesame");
+        }
+
+        #[test]
+        fn secret_for_is_empty_without_a_saved_secret() {
+            let (_dir, vault) = temp_vault();
+            let unset_password = AuthMethod::Password {
+                password_enc: String::new(),
+            };
+            let bare_key = AuthMethod::Key {
+                private_key: "/home/u/.ssh/id_ed25519".into(),
+                passphrase_enc: None,
+            };
+            assert_eq!(secret_for(&unset_password, &vault), "");
+            assert_eq!(secret_for(&bare_key, &vault), "");
+            assert_eq!(secret_for(&AuthMethod::Agent, &vault), "");
+        }
+
+        /// Records `remove_file` calls; everything else is out of scope.
+        #[derive(Default)]
+        struct FakeFs {
+            removed: RefCell<Vec<String>>,
+        }
+
+        impl RemoteFs for FakeFs {
+            fn home(&self) -> String {
+                "/".into()
+            }
+            fn realpath(&self, path: &str) -> Result<String> {
+                Ok(path.into())
+            }
+            fn stat(&self, _: &str) -> Result<RStat> {
+                unimplemented!()
+            }
+            fn list(&self, _: &str) -> Result<Vec<FileEntry>> {
+                Ok(Vec::new())
+            }
+            fn read_file(
+                &self,
+                _: &str,
+                _: &mut dyn std::io::Write,
+                _: &mut dyn FnMut(u64),
+            ) -> Result<()> {
+                unimplemented!()
+            }
+            fn write_file(
+                &self,
+                _: &str,
+                _: &mut dyn std::io::Read,
+                _: &mut dyn FnMut(u64),
+            ) -> Result<()> {
+                unimplemented!()
+            }
+            fn mkdir(&self, _: &str) -> Result<()> {
+                unimplemented!()
+            }
+            fn create_empty(&self, _: &str) -> Result<()> {
+                unimplemented!()
+            }
+            fn rename(&self, _: &str, _: &str) -> Result<()> {
+                unimplemented!()
+            }
+            fn remove_file(&self, path: &str) -> Result<()> {
+                self.removed.borrow_mut().push(path.into());
+                Ok(())
+            }
+            fn remove_dir(&self, _: &str) -> Result<()> {
+                unimplemented!()
+            }
+        }
+
+        #[test]
+        fn scratch_file_is_removed_when_a_panic_unwinds_past_it() {
+            let fs = FakeFs::default();
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let _scratch = ScratchFile::new(&fs, "/tmp/ferropipe-probe-1.txt".into());
+                panic!("assertion failed halfway");
+            }));
+            assert!(outcome.is_err());
+            assert_eq!(*fs.removed.borrow(), ["/tmp/ferropipe-probe-1.txt"]);
+        }
+
+        #[test]
+        fn scratch_file_removed_now_is_not_removed_again_on_drop() {
+            let fs = FakeFs::default();
+            {
+                let mut scratch = ScratchFile::new(&fs, "/tmp/ferropipe-probe-2.txt".into());
+                scratch.remove_now().expect("remove");
+            }
+            assert_eq!(*fs.removed.borrow(), ["/tmp/ferropipe-probe-2.txt"]);
+        }
+    }
+}
+
+/// Live probe against a saved SMB host, opt-in: set `FERROPIPE_SMB_PROBE` to
+/// the saved connection's name and run
+/// `FERROPIPE_SMB_PROBE=<name> cargo test smb::live_probe -- --ignored --nocapture`.
+/// Reads the real store and vault, never prints the secret, downloads
+/// `C$/Windows/win.ini` into a local temp dir, and writes one scratch file
+/// `ferropipe-probe-<pid>.txt` under `C$/Windows/Temp`, which it removes again.
+#[cfg(test)]
+mod live_probe {
+    use super::super::{OnConflict, Outcome, download};
+    use super::probe_support::{saved_connection, scratch_round_trip};
+    use super::*;
+    use crate::model::ConnectionKind;
+
     fn names(entries: &[FileEntry]) -> Vec<&str> {
         entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// Download `C$/Windows/win.ini` into a temp dir; returns its size.
+    fn download_win_ini(fs: &SmbFs) -> usize {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = ["/C$/Windows/win.ini".to_string()];
+        let outcome = download(fs, 1, &remote, tmp.path(), OnConflict::Overwrite, &|_ev| {})
+            .expect("download win.ini");
+        assert_eq!(outcome, Outcome::Done, "download was parked on a conflict");
+        std::fs::read(tmp.path().join("win.ini"))
+            .expect("downloaded file")
+            .len()
     }
 
     #[test]
@@ -266,7 +521,7 @@ mod live_probe {
             println!("FERROPIPE_SMB_PROBE not set; skipping");
             return;
         };
-        let (conn, secret) = saved_smb_connection(&name);
+        let (conn, secret) = saved_connection(&name, ConnectionKind::Smb);
         println!("[1] connecting to smb://{} as {}", conn.host, conn.username);
         let fs = SmbFs::connect(&conn, Some(&secret)).expect("connect");
         println!(
@@ -275,43 +530,9 @@ mod live_probe {
         );
         let win = fs.list("/C$/Windows").expect("list C$/Windows");
         println!("[3] C$/Windows: {} entries", win.len());
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let quiet = |_e: super::super::Event| {};
-        download(
-            &fs,
-            1,
-            &["/C$/Windows/win.ini".to_string()],
-            tmp.path(),
-            &quiet,
-        )
-        .expect("download win.ini");
-        let bytes = std::fs::read(tmp.path().join("win.ini")).expect("downloaded file");
-        println!("[4] downloaded win.ini: {} bytes", bytes.len());
-        assert!(!bytes.is_empty());
-
-        let file = format!("ferropipe-probe-{}.txt", std::process::id());
-        let local: PathBuf = tmp.path().join(&file);
-        std::fs::write(&local, b"ferropipe smb probe\n").expect("write scratch");
-        upload(&fs, 2, &[local], "/C$/Windows/Temp", &quiet).expect("upload");
-        let remote_path = format!("/C$/Windows/Temp/{file}");
-        let temp = fs.list("/C$/Windows/Temp").expect("list Temp");
-        assert!(
-            names(&temp).contains(&file.as_str()),
-            "uploaded file not listed"
-        );
-        let mut back = Vec::new();
-        fs.read_file(&remote_path, &mut back, &mut |_| {})
-            .expect("read back");
-        assert_eq!(back, b"ferropipe smb probe\n");
-        println!("[5] uploaded, listed and read back {file}");
-
-        fs.remove_file(&remote_path).expect("remove scratch");
-        let temp = fs.list("/C$/Windows/Temp").expect("list Temp again");
-        assert!(
-            !names(&temp).contains(&file.as_str()),
-            "scratch file still there"
-        );
-        println!("[6] removed {file}");
+        let size = download_win_ini(&fs);
+        println!("[4] downloaded win.ini: {size} bytes");
+        assert!(size > 0, "win.ini came back empty");
+        scratch_round_trip(&fs, "/C$/Windows/Temp", 5);
     }
 }

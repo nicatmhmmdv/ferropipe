@@ -257,3 +257,77 @@ pub fn resolve_home(sftp: &Sftp) -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_string())
 }
+
+/// Live probe against a saved SSH host, opt-in: set `FERROPIPE_SFTP_PROBE` to
+/// the saved connection's name and run
+/// `FERROPIPE_SFTP_PROBE=<name> cargo test sftp::live_probe -- --ignored --nocapture`.
+/// Reads the real store and vault (password, key passphrase or ssh-agent, as
+/// saved) and never prints the secret. Like the app, `connect` records an
+/// unknown host key in `~/.ssh/known_hosts`. On the host it runs
+/// `echo ferropipe-probe` and writes one scratch file `ferropipe-probe-<pid>.txt`
+/// into the login user's home directory, which it removes again.
+#[cfg(test)]
+mod live_probe {
+    use super::*;
+    use crate::model::ConnectionKind;
+    use crate::remote::smb::probe_support::{
+        auth_label, exec_stdout, saved_connection, scratch_round_trip,
+    };
+
+    /// What `connect` gets as the secret: the password, the key passphrase if
+    /// there is one, and nothing for agent auth (the agent holds the keys).
+    fn secret_arg<'a>(auth: &AuthMethod, secret: &'a str) -> Option<&'a str> {
+        match auth {
+            AuthMethod::Agent => None,
+            AuthMethod::Key { .. } if secret.is_empty() => None,
+            AuthMethod::Password { .. } | AuthMethod::Key { .. } => Some(secret),
+        }
+    }
+
+    #[test]
+    fn secret_arg_passes_passwords_and_passphrases_but_nothing_for_agent() {
+        let password = AuthMethod::Password {
+            password_enc: "blob".into(),
+        };
+        let key = AuthMethod::Key {
+            private_key: "/home/u/.ssh/id_ed25519".into(),
+            passphrase_enc: None,
+        };
+        assert_eq!(secret_arg(&password, "pw"), Some("pw"));
+        assert_eq!(secret_arg(&key, "phrase"), Some("phrase"));
+        assert_eq!(secret_arg(&key, ""), None);
+        assert_eq!(secret_arg(&AuthMethod::Agent, "ignored"), None);
+    }
+
+    #[test]
+    #[ignore = "needs a saved SSH host on the network; see the module docs"]
+    fn sftp_round_trip_against_saved_host() {
+        let Ok(name) = std::env::var("FERROPIPE_SFTP_PROBE") else {
+            println!("FERROPIPE_SFTP_PROBE not set; skipping");
+            return;
+        };
+        let (conn, secret) = saved_connection(&name, ConnectionKind::Ssh);
+        println!(
+            "[1] connecting to {}@{}:{} ({} auth)",
+            conn.username,
+            conn.host,
+            conn.port,
+            auth_label(&conn.auth)
+        );
+        let session = connect(&conn, secret_arg(&conn.auth, &secret)).expect("connect");
+        let sftp = session.sftp().expect("open sftp");
+        let home = resolve_home(&sftp);
+        let fs = SftpFs {
+            session: &session,
+            sftp: &sftp,
+            home: home.clone(),
+        };
+        let entries = fs.list(&home).expect("list home");
+        println!("[2] home {home}: {} entries", entries.len());
+        let (code, lines) = exec_stdout(&fs, "echo ferropipe-probe");
+        assert_eq!(code, 0, "echo exited {code}");
+        assert_eq!(lines, ["ferropipe-probe"]);
+        println!("[3] exec echo: {lines:?} (exit {code})");
+        scratch_round_trip(&fs, &home, 4);
+    }
+}

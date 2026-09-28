@@ -1,0 +1,86 @@
+# Ferropipe CI.
+#
+# The crate depends on two sibling checkouts through path dependencies:
+#   ferropipe/Cargo.toml      -> ferropipe-rdp = { path = "../ferropipe-rdp" }
+#   ferropipe-rdp/Cargo.toml  -> rdpeudp       = { path = "../rdpeudp" }
+# so the job checks the three repositories out side by side under the workspace
+# (ferropipe/, ferropipe-rdp/, rdpeudp/) and runs cargo from ferropipe/.
+# Both siblings must exist on GitHub before this workflow can pass; if either is
+# private, give the two sibling checkouts a `token:` with read access.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build, test, clippy, fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out ferropipe
+        uses: actions/checkout@v4
+        with:
+          path: ferropipe
+
+      - name: Check out ferropipe-rdp (path dependency ../ferropipe-rdp)
+        uses: actions/checkout@v4
+        with:
+          repository: nicatmhmmdv/ferropipe-rdp
+          path: ferropipe-rdp
+
+      - name: Check out rdpeudp (path dependency of ferropipe-rdp)
+        uses: actions/checkout@v4
+        with:
+          repository: nicatmhmmdv/rdpeudp
+          path: rdpeudp
+
+      - name: Install native libraries (libssh2, OpenSSL, libsmbclient)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssh2-1-dev libssl-dev libsmbclient-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ferropipe
+
+      - name: cargo build
+        working-directory: ferropipe
+        run: cargo build --locked
+
+      # No --all-features: the only optional feature, `bundled-fonts`, embeds
+      # IBM Plex TTFs that are not in the repository (see assets/fonts/README.md),
+      # so building it here would fail on the missing files.
+      - name: cargo test
+        working-directory: ferropipe
+        run: cargo test --locked
+
+      - name: cargo clippy
+        working-directory: ferropipe
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo fmt
+        working-directory: ferropipe
+        run: cargo fmt --check
+
+  # Advisory only: a new RustSec advisory should not block a merge, but it
+  # should be visible on the run.
+  audit:
+    name: cargo audit (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      # cargo-audit only reads Cargo.lock, so the siblings are not needed and
+      # the repository can sit at the workspace root, where the action looks.
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
