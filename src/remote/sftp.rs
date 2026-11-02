@@ -87,24 +87,30 @@ impl RemoteFs for SftpFs<'_> {
         input: &mut dyn std::io::Read,
         progress: &mut dyn FnMut(u64),
     ) -> Result<()> {
+        // Through a `.ferropipe-part` sibling that is removed again on failure.
         let tmp = format!("{path}.ferropipe-part");
-        {
-            let mut f = self
-                .sftp
-                .open_mode(
-                    Path::new(&tmp),
-                    OpenFlags::WRITE | OpenFlags::TRUNCATE | OpenFlags::CREATE,
-                    0o644,
-                    OpenType::File,
-                )
-                .with_context(|| format!("create remote {tmp}"))?;
-            copy_with_progress(input, &mut f, progress)?;
+        let written: Result<()> = (|| {
+            {
+                let mut f = self
+                    .sftp
+                    .open_mode(
+                        Path::new(&tmp),
+                        OpenFlags::WRITE | OpenFlags::TRUNCATE | OpenFlags::CREATE,
+                        0o644,
+                        OpenType::File,
+                    )
+                    .with_context(|| format!("create remote {tmp}"))?;
+                copy_with_progress(input, &mut f, progress)?;
+            }
+            let _ = self.sftp.unlink(Path::new(path));
+            self.sftp
+                .rename(Path::new(&tmp), Path::new(path), None)
+                .with_context(|| format!("finalize {path}"))
+        })();
+        if written.is_err() {
+            let _ = self.sftp.unlink(Path::new(&tmp));
         }
-        let _ = self.sftp.unlink(Path::new(path));
-        self.sftp
-            .rename(Path::new(&tmp), Path::new(path), None)
-            .with_context(|| format!("finalize {path}"))?;
-        Ok(())
+        written
     }
 
     fn mkdir(&self, path: &str) -> Result<()> {

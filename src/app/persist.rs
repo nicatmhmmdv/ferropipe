@@ -58,6 +58,12 @@ pub(super) fn pane_hosts(
     ]
 }
 
+/// Whether a worker error message came from a directory listing (the worker
+/// prefixes its errors with the operation, `list <path>: …`).
+pub(super) fn is_listing_error(msg: &str) -> bool {
+    msg.starts_with("list ")
+}
+
 /// Where a fresh session lists first: a remembered directory other than
 /// `home`, flagged `true` so a failure can fall back to home — else home.
 pub(super) fn first_listing(remembered: Option<String>, home: &str) -> (String, bool) {
@@ -142,9 +148,13 @@ impl FerropipeApp {
     /// The first listing of a restored directory failed: list home instead,
     /// once. `false` when no restore was in progress on `side`.
     pub(super) fn fall_back_to_home(&mut self, side: Side, msg: &str) -> bool {
-        if !std::mem::take(&mut self.restoring[side as usize]) {
+        // Only a failed *listing* can be the restore attempt; any other error
+        // arriving meanwhile (a stale one from a previous host, say) goes
+        // through the normal path and leaves the flag for the listing to clear.
+        if !self.restoring[side as usize] || !is_listing_error(msg) {
             return false;
         }
+        self.restoring[side as usize] = false;
         let Some(home) = self.side_pane(side).home.clone() else {
             return false;
         };
@@ -201,6 +211,17 @@ mod tests {
         let plan = restore_plan(&s, &[nas.clone(), web.clone()]);
         // Assert
         assert_eq!(plan, vec![(Side::Right, web.id), (Side::Left, nas.id)]);
+    }
+
+    #[test]
+    fn restore_plan_reopens_the_same_host_in_both_panes() {
+        // Arrange: each pane has its own worker, so the same host twice is fine.
+        let nas = file_host("nas");
+        let s = settings([Some(nas.id), Some(nas.id)]);
+        // Act
+        let plan = restore_plan(&s, std::slice::from_ref(&nas));
+        // Assert
+        assert_eq!(plan, vec![(Side::Right, nas.id), (Side::Left, nas.id)]);
     }
 
     #[test]
@@ -295,6 +316,27 @@ mod tests {
         assert_eq!(
             first_listing(Some("/root".into()), "/root"),
             ("/root".to_string(), false)
+        );
+    }
+
+    // -- is_listing_error ----------------------------------------------------
+
+    #[test]
+    fn is_listing_error_matches_only_the_workers_list_context() {
+        assert!(is_listing_error("list /var/log: No such file or directory"));
+        assert!(!is_listing_error("upload: Permission denied"));
+        assert!(!is_listing_error("connect: timed out"));
+        assert!(!is_listing_error("listing failed"));
+    }
+
+    #[test]
+    fn existing_dir_drops_a_path_that_is_a_file_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            existing_dir(Some(file.to_string_lossy().into_owned())),
+            None
         );
     }
 }

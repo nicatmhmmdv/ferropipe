@@ -159,26 +159,32 @@ impl RemoteFs for SmbFs {
         input: &mut dyn std::io::Read,
         progress: &mut dyn FnMut(u64),
     ) -> Result<()> {
+        // Through a `.ferropipe-part` sibling that is removed again on failure.
         let tmp = format!("{path}.ferropipe-part");
-        {
-            let mut f = self
-                .client
-                .open_with(
-                    &tmp,
-                    SmbOpenOptions::default()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o644),
-                )
-                .map_err(|e| anyhow!("create {tmp}: {e:?}"))?;
-            copy_with_progress(input, &mut f, progress)?;
+        let written: Result<()> = (|| {
+            {
+                let mut f = self
+                    .client
+                    .open_with(
+                        &tmp,
+                        SmbOpenOptions::default()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .mode(0o644),
+                    )
+                    .map_err(|e| anyhow!("create {tmp}: {e:?}"))?;
+                copy_with_progress(input, &mut f, progress)?;
+            }
+            let _ = self.client.unlink(norm(path));
+            self.client
+                .rename(tmp.clone(), norm(path))
+                .map_err(|e| anyhow!("finalize: {e:?}"))
+        })();
+        if written.is_err() {
+            let _ = self.client.unlink(&tmp);
         }
-        let _ = self.client.unlink(norm(path));
-        self.client
-            .rename(tmp, norm(path))
-            .map_err(|e| anyhow!("finalize: {e:?}"))?;
-        Ok(())
+        written
     }
 
     fn mkdir(&self, path: &str) -> Result<()> {

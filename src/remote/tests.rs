@@ -1,7 +1,7 @@
 //! Unit tests for the worker's pure helpers and the local → local copy.
 
 use super::conflicts::{Existing, find_conflicts, refuse_mismatches, renamed_name};
-use super::transfer::{TransferPlan, copy_target, part_path, plan_local_copy};
+use super::transfer::{TransferPlan, copy_target, download, part_path, plan_local_copy};
 use super::*;
 
 #[test]
@@ -483,4 +483,69 @@ fn copy_local_overwrite_refuses_a_directory_in_the_way_before_writing() {
         "{events:?}"
     );
     assert!(dest.join("f.txt").is_dir());
+}
+
+// -- download cleanup ---------------------------------------------------
+
+/// A remote holding one 8-byte file whose read breaks off halfway through.
+struct HalfReadFs;
+
+impl RemoteFs for HalfReadFs {
+    fn home(&self) -> String {
+        "/".into()
+    }
+    fn realpath(&self, path: &str) -> Result<String> {
+        Ok(path.into())
+    }
+    fn stat(&self, _: &str) -> Result<RStat> {
+        Ok(RStat {
+            is_dir: false,
+            size: 8,
+        })
+    }
+    fn list(&self, _: &str) -> Result<Vec<FileEntry>> {
+        unimplemented!()
+    }
+    fn read_file(&self, _: &str, out: &mut dyn Write, progress: &mut dyn FnMut(u64)) -> Result<()> {
+        out.write_all(b"half")?;
+        progress(4);
+        Err(anyhow!("connection reset"))
+    }
+    fn write_file(&self, _: &str, _: &mut dyn Read, _: &mut dyn FnMut(u64)) -> Result<()> {
+        unimplemented!()
+    }
+    fn mkdir(&self, _: &str) -> Result<()> {
+        unimplemented!()
+    }
+    fn create_empty(&self, _: &str) -> Result<()> {
+        unimplemented!()
+    }
+    fn rename(&self, _: &str, _: &str) -> Result<()> {
+        unimplemented!()
+    }
+    fn remove_file(&self, _: &str) -> Result<()> {
+        unimplemented!()
+    }
+    fn remove_dir(&self, _: &str) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+#[test]
+fn download_that_fails_midway_leaves_no_part_file_behind() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().to_path_buf();
+    let remote = ["/srv/f.txt".to_string()];
+    // Act
+    let result = download(&HalfReadFs, 1, &remote, &dest, OnConflict::Ask, &|_| {});
+    // Assert: the copy failed, the target was never created and the temp
+    // sibling did not survive it.
+    assert!(result.is_err());
+    assert!(!dest.join("f.txt").exists());
+    let left: Vec<_> = std::fs::read_dir(&dest)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
 }

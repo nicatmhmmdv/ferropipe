@@ -277,7 +277,7 @@ impl FerropipeApp {
         }
         if self.lconnected.is_some() {
             self.lworker.send(Command::Disconnect);
-            self.lconnected = None;
+            self.clear_left_session();
         }
         let name = conn.name.clone();
         let secret = self.decrypt_secret(&conn);
@@ -298,6 +298,19 @@ impl FerropipeApp {
     }
 
     /// Revert the left pane from a remote session back to the local filesystem.
+    /// Forget the left pane's remote session state before a new connect on
+    /// that side (mirror of `clear_right_session`): a listing or restore still
+    /// in flight for the old host must not be attributed to the new one.
+    fn clear_left_session(&mut self) {
+        self.lconnected = None;
+        self.lpending = None;
+        self.restoring[Side::Left as usize] = false;
+        self.local.entries.clear();
+        self.local.selected.clear();
+        self.local.error = None;
+        self.local.loading = false;
+    }
+
     pub(super) fn revert_left_to_local(&mut self) {
         self.left_remote = false;
         self.lconnected = None;
@@ -448,6 +461,10 @@ impl FerropipeApp {
         if let Some(id) = failed {
             self.host_errors.insert(id, msg);
         }
+        // A failed connect or a revert to local changes what each pane shows;
+        // keep the remembered pane hosts in step so "Reopen" never brings back
+        // a host the user had already moved away from.
+        self.sync_pane_hosts();
     }
 
     /// A session ended. Nothing to tear down when the pane already went back

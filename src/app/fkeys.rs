@@ -55,8 +55,8 @@ fn pane_outcome(action: FKeyAction, single: Option<String>) -> Option<PaneOutcom
 }
 
 impl FerropipeApp {
-    /// True while a modal window owns the keyboard.
-    fn modal_open(&self) -> bool {
+    /// True while a modal window owns the keyboard (and the workspace is disabled).
+    pub(super) fn modal_open(&self) -> bool {
         self.editor.is_some()
             || self.prompt.is_some()
             || self.confirm_delete.is_some()

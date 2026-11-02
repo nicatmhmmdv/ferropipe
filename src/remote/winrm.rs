@@ -7,7 +7,7 @@
 
 use super::{Event, RStat, RemoteFs, copy_with_progress};
 use crate::model::{Connection, FileEntry};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::io::{Read, Write};
 use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
@@ -188,15 +188,29 @@ impl RemoteFs for WinRmFs {
         input: &mut dyn Read,
         progress: &mut dyn FnMut(u64),
     ) -> Result<()> {
-        // Spill to a private temp, then use winrm's built-in chunked upload.
+        // Spill to a private temp, upload it with winrm's built-in chunked
+        // upload to a `.ferropipe-part` sibling, then move that over the target
+        // (temp + rename, as the trait promises) so a failed upload never
+        // leaves a half-written file under the real name. The sibling is
+        // removed again on failure, best effort.
         let mut tmp = tempfile::NamedTempFile::new().map_err(|e| anyhow!("temp: {e}"))?;
         std::io::copy(input, tmp.as_file_mut())?;
         tmp.as_file_mut().flush()?;
         let size = tmp.as_file().metadata().map(|m| m.len()).unwrap_or(0);
-        let win = path.replace('/', "\\");
-        self.rt
+        let part = format!("{path}.ferropipe-part");
+        let win = part.replace('/', "\\");
+        let written: Result<()> = self
+            .rt
             .block_on(self.client.upload_file(&self.host, tmp.path(), &win))
-            .map_err(|e| anyhow!("upload {path}: {e}"))?;
+            .map_err(|e| anyhow!("upload {path}: {e}"))
+            .and_then(|_| {
+                self.rename(&part, path)
+                    .with_context(|| format!("finalize {path}"))
+            });
+        if written.is_err() {
+            let _ = self.remove_file(&part);
+        }
+        written?;
         progress(size); // winrm upload is opaque; report the whole file at completion
         Ok(())
     }

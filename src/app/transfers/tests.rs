@@ -402,3 +402,92 @@ fn retry_refused_when_the_left_side_changed_host() {
     assert!(!retry_allowed([None, right], [Some(Uuid::new_v4()), right]));
     assert!(!retry_allowed([Some(Uuid::new_v4()), right], [None, right]));
 }
+
+// -- transfer_command --------------------------------------------------
+
+/// A request for two paths from a left pane in `remote` mode, pinned to `dest_dir`.
+fn request(remote: bool, dest_dir: &str) -> RetryRequest {
+    RetryRequest {
+        payload: DragPayload {
+            side: Side::Left,
+            remote,
+            paths: vec!["/srv/a.txt".to_string(), "/srv/b".to_string()],
+        },
+        dest: Side::Right,
+        dest_dir: dest_dir.to_string(),
+        hosts: [None, None],
+    }
+}
+
+/// The directory a transfer command writes into.
+fn command_dest_dir(cmd: &Command) -> String {
+    match cmd {
+        Command::Download { local_dir, .. } => local_dir.to_string_lossy().into_owned(),
+        Command::Upload { remote_dir, .. } => remote_dir.clone(),
+        Command::CopyLocal { dest_dir, .. } => dest_dir.to_string_lossy().into_owned(),
+        _ => panic!("not a transfer command"),
+    }
+}
+
+#[test]
+fn transfer_command_download_goes_to_the_pinned_local_directory() {
+    // Arrange
+    let req = request(true, "/home/u/inbox");
+    // Act
+    let cmd = transfer_command(7, &req, Verb::Download, OnConflict::Skip);
+    // Assert
+    assert!(matches!(
+        &cmd,
+        Command::Download { id: 7, remote, on_conflict: OnConflict::Skip, .. }
+            if *remote == req.payload.paths
+    ));
+    assert_eq!(command_dest_dir(&cmd), "/home/u/inbox");
+}
+
+#[test]
+fn transfer_command_upload_goes_to_the_pinned_remote_directory() {
+    let req = request(false, "/srv/www");
+    let cmd = transfer_command(3, &req, Verb::Upload, OnConflict::Rename);
+    let expected = [PathBuf::from("/srv/a.txt"), PathBuf::from("/srv/b")];
+    assert!(matches!(
+        &cmd,
+        Command::Upload { id: 3, local, on_conflict: OnConflict::Rename, .. }
+            if local.as_slice() == expected
+    ));
+    assert_eq!(command_dest_dir(&cmd), "/srv/www");
+}
+
+#[test]
+fn transfer_command_copy_goes_to_the_pinned_local_directory() {
+    let req = request(false, "/home/u/out");
+    let cmd = transfer_command(5, &req, Verb::Copy, OnConflict::Ask);
+    assert!(matches!(
+        &cmd,
+        Command::CopyLocal {
+            id: 5,
+            on_conflict: OnConflict::Ask,
+            ..
+        }
+    ));
+    assert_eq!(command_dest_dir(&cmd), "/home/u/out");
+}
+
+#[test]
+fn transfer_command_replays_into_the_pinned_directory_not_the_panes() {
+    // Arrange: the request was issued while the pane showed /home/u/first,
+    // and the pane has moved on since. A replay never consults the pane.
+    let req = request(true, "/home/u/first");
+    let pane_cwd_now = "/home/u/elsewhere";
+    // Act: the conflict answer re-issues the same request with its policy.
+    let cmd = transfer_command(8, &req, Verb::Download, OnConflict::Overwrite);
+    // Assert
+    assert_eq!(command_dest_dir(&cmd), "/home/u/first");
+    assert_ne!(command_dest_dir(&cmd), pane_cwd_now);
+    assert!(matches!(
+        cmd,
+        Command::Download {
+            on_conflict: OnConflict::Overwrite,
+            ..
+        }
+    ));
+}

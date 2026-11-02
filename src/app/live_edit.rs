@@ -53,6 +53,8 @@ impl FerropipeApp {
     }
 
     /// Poll edited temp files; re-upload any that changed since last check.
+    /// The re-upload is `Overwrite` with no staleness check: an external edit
+    /// of the remote file between two save cycles is written over.
     pub(super) fn poll_edits(&mut self, ctx: &egui::Context) {
         let mut uploads: Vec<(Side, PathBuf, String, String)> = Vec::new();
         for w in &mut self.edits {
@@ -94,7 +96,8 @@ impl FerropipeApp {
             let id = self.push_transfer(ctx, spec);
             self.side_send(
                 side,
-                // Replacing the edited file is the point of the sync.
+                // Replacing the edited file is the point of the sync; a remote
+                // change made since the last cycle is overwritten with it.
                 Command::Upload {
                     id,
                     local: vec![temp],

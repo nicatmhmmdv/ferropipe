@@ -4,9 +4,12 @@
 #   ferropipe/Cargo.toml      -> ferropipe-rdp = { path = "../ferropipe-rdp" }
 #   ferropipe-rdp/Cargo.toml  -> rdpeudp       = { path = "../rdpeudp" }
 # so the job checks the three repositories out side by side under the workspace
-# (ferropipe/, ferropipe-rdp/, rdpeudp/) and runs cargo from ferropipe/.
-# Both siblings must exist on GitHub before this workflow can pass; if either is
-# private, give the two sibling checkouts a `token:` with read access.
+# (ferropipe/, ferropipe-rdp/, rdpeudp/) and runs cargo from ferropipe/. Each
+# sibling is taken at the branch this run is for when it has one of that name
+# (so a feature branch spanning repositories builds against itself), else at
+# its default branch. Both siblings must exist on GitHub before this workflow
+# can pass; if either is private, put a token with read access into its clone
+# URL (`https://x-access-token:${{ secrets.SIBLING_TOKEN }}@github.com/...`).
 name: CI
 
 on:
@@ -27,17 +30,17 @@ jobs:
         with:
           path: ferropipe
 
-      - name: Check out ferropipe-rdp (path dependency ../ferropipe-rdp)
-        uses: actions/checkout@v4
-        with:
-          repository: nicatmhmmdv/ferropipe-rdp
-          path: ferropipe-rdp
+      - name: Check out ferropipe-rdp (same branch if it exists, else default)
+        env: { BRANCH: "${{ github.head_ref || github.ref_name }}" }
+        run: |
+          git clone --depth 1 https://github.com/nicatmhmmdv/ferropipe-rdp.git ferropipe-rdp
+          git -C ferropipe-rdp fetch --depth 1 origin "$BRANCH" && git -C ferropipe-rdp checkout FETCH_HEAD || echo "ferropipe-rdp: no branch $BRANCH, using default"
 
-      - name: Check out rdpeudp (path dependency of ferropipe-rdp)
-        uses: actions/checkout@v4
-        with:
-          repository: nicatmhmmdv/rdpeudp
-          path: rdpeudp
+      - name: Check out rdpeudp (same branch if it exists, else default)
+        env: { BRANCH: "${{ github.head_ref || github.ref_name }}" }
+        run: |
+          git clone --depth 1 https://github.com/nicatmhmmdv/rdpeudp.git rdpeudp
+          git -C rdpeudp fetch --depth 1 origin "$BRANCH" && git -C rdpeudp checkout FETCH_HEAD || echo "rdpeudp: no branch $BRANCH, using default"
 
       - name: Install native libraries (libssh2, OpenSSL, libsmbclient)
         run: |

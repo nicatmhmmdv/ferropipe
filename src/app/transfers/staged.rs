@@ -22,12 +22,12 @@ pub(in crate::app) struct StageJob {
 
 impl FerropipeApp {
     /// remote → remote: download into a temp dir now, upload from it when that
-    /// finishes. The temp dir is private, so only the upload leg can conflict.
+    /// finishes. The temp dir is private, so only the upload leg can conflict;
+    /// it goes to the directory pinned in `req`.
     pub(super) fn start_staged(
         &mut self,
         ctx: &egui::Context,
-        payload: DragPayload,
-        dest: Side,
+        req: RetryRequest,
         on_conflict: OnConflict,
     ) {
         let temp_dir = std::env::temp_dir().join(format!(
@@ -39,13 +39,14 @@ impl FerropipeApp {
             self.toast(ctx, format!("stage: {e:#}"), true);
             return;
         }
-        let spec = self.transfer_spec(&payload, dest, payload.side, Verb::Copy);
+        let src = req.payload.side;
+        let spec = self.transfer_spec(&req, src, Verb::Copy);
         let job = StageJob {
             temp_dir: temp_dir.clone(),
-            names: payload.paths.iter().map(|p| base_name(p)).collect(),
-            dest_dir: self.side_pane(dest).cwd.clone(),
-            dest,
-            dest_host: self.side_host(dest),
+            names: req.payload.paths.iter().map(|p| base_name(p)).collect(),
+            dest_dir: req.dest_dir,
+            dest: req.dest,
+            dest_host: self.side_host(req.dest),
             label: spec.label.clone(),
             dest_label: spec.dest.clone(),
             on_conflict,
@@ -53,11 +54,11 @@ impl FerropipeApp {
         let id = self.push_transfer(ctx, spec);
         let cmd = Command::Download {
             id,
-            remote: payload.paths,
+            remote: req.payload.paths,
             local_dir: temp_dir,
             on_conflict: OnConflict::Overwrite,
         };
-        self.side_send(payload.side, cmd);
+        self.side_send(src, cmd);
         self.stage_download.insert(id, job);
     }
 

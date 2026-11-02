@@ -59,13 +59,18 @@ pub(super) struct TransferState {
     pub finished_at: Option<f64>,
 }
 
-/// Everything needed to replay a transfer, plus the hosts it was aimed at.
-/// A retry is only valid while both sides still talk to the same hosts:
-/// the paths in `payload` are absolute paths on a specific machine.
+/// Everything needed to replay a transfer, plus where it was aimed. A retry
+/// is only valid while both sides still talk to the same hosts: the paths in
+/// `payload` are absolute paths on a specific machine. The destination
+/// directory is pinned when the transfer is first issued, so a replay (Retry,
+/// or a conflict answer) writes where the user was shown the conflicts even
+/// if the pane has moved on since.
 #[derive(Clone)]
 pub(super) struct RetryRequest {
     pub payload: DragPayload,
     pub dest: Side,
+    /// `dest`'s current directory when the transfer was first issued.
+    pub dest_dir: String,
     /// Connected host per side (left, right) when the transfer started.
     pub hosts: [Option<Uuid>; 2],
 }
@@ -333,6 +338,41 @@ pub(super) fn retry_allowed(req_hosts: [Option<Uuid>; 2], current: [Option<Uuid>
     req_hosts == current
 }
 
+/// The worker command for transfer `id`: `req.payload`'s paths into the
+/// directory pinned in `req.dest_dir`, with `on_conflict`. Every issue of a
+/// request — the first and each replay — builds its command here, so a replay
+/// never reads the pane again. `verb` is the request's [`transfer_verb`]; a
+/// remote → remote copy is `Verb::Copy` too but never comes here (it is
+/// staged in two legs, see `staged`), so `Copy` means local → local.
+pub(super) fn transfer_command(
+    id: u64,
+    req: &RetryRequest,
+    verb: Verb,
+    on_conflict: OnConflict,
+) -> Command {
+    let local_paths = || req.payload.paths.iter().map(PathBuf::from).collect();
+    match verb {
+        Verb::Download => Command::Download {
+            id,
+            remote: req.payload.paths.clone(),
+            local_dir: PathBuf::from(&req.dest_dir),
+            on_conflict,
+        },
+        Verb::Upload => Command::Upload {
+            id,
+            local: local_paths(),
+            remote_dir: req.dest_dir.clone(),
+            on_conflict,
+        },
+        Verb::Copy => Command::CopyLocal {
+            id,
+            paths: local_paths(),
+            dest_dir: PathBuf::from(&req.dest_dir),
+            on_conflict,
+        },
+    }
+}
+
 /// Toast text for a finished transfer: `(message, detail)`.
 pub(super) fn result_toast(done: &Finished) -> (String, Option<String>) {
     if let Some(error) = &done.error {
@@ -422,7 +462,8 @@ impl FerropipeApp {
     }
 
     /// Move `payload`'s paths into `dest`'s current directory, treating files
-    /// already there per `on_conflict`.
+    /// already there per `on_conflict`. The directory is pinned now: every
+    /// replay of this request goes to the same place.
     pub(super) fn start_transfer_with(
         &mut self,
         ctx: &egui::Context,
@@ -430,31 +471,18 @@ impl FerropipeApp {
         dest: Side,
         on_conflict: OnConflict,
     ) {
-        if payload.side == dest || payload.paths.is_empty() {
-            return;
-        }
-        if payload.remote != self.side_is_remote(payload.side) {
-            self.toast(
-                ctx,
-                "The source pane changed — select the files again",
-                true,
-            );
-            return;
-        }
-        if !self.side_usable(payload.side) || !self.side_usable(dest) {
-            self.toast(ctx, "Both sides must be connected to transfer", true);
-            return;
-        }
-        match (payload.remote, self.side_is_remote(dest)) {
-            (true, false) => self.start_download(ctx, payload, dest, on_conflict),
-            (false, true) => self.start_upload(ctx, payload, dest, on_conflict),
-            (true, true) => self.start_staged(ctx, payload, dest, on_conflict),
-            (false, false) => self.start_local_copy(ctx, payload, dest, on_conflict),
-        }
+        let req = RetryRequest {
+            payload,
+            dest,
+            dest_dir: self.side_pane(dest).cwd.clone(),
+            hosts: self.session_hosts(),
+        };
+        self.issue_request(ctx, req, on_conflict);
     }
 
     /// Re-run a remembered request with `on_conflict`, as long as both panes
-    /// still show the hosts it was aimed at.
+    /// still show the hosts it was aimed at. It writes into the directory
+    /// pinned in the request, not wherever the pane is now.
     pub(super) fn replay_request(
         &mut self,
         ctx: &egui::Context,
@@ -462,7 +490,7 @@ impl FerropipeApp {
         on_conflict: OnConflict,
     ) {
         if retry_allowed(req.hosts, self.session_hosts()) {
-            self.start_transfer_with(ctx, req.payload, req.dest, on_conflict);
+            self.issue_request(ctx, req, on_conflict);
         } else {
             self.toast(
                 ctx,
@@ -472,75 +500,61 @@ impl FerropipeApp {
         }
     }
 
-    /// Row description for a request into `dest`'s current directory, run by
-    /// `worker` (the destination side counts as an upload).
+    /// Issue `req`, first time or replay: check both sides are still fit for
+    /// it, queue the row and send the one command that moves the files into
+    /// `req.dest_dir`. A remote → remote copy is staged instead.
+    fn issue_request(&mut self, ctx: &egui::Context, req: RetryRequest, on_conflict: OnConflict) {
+        let (src, dest) = (req.payload.side, req.dest);
+        if src == dest || req.payload.paths.is_empty() {
+            return;
+        }
+        if req.payload.remote != self.side_is_remote(src) {
+            self.toast(
+                ctx,
+                "The source pane changed — select the files again",
+                true,
+            );
+            return;
+        }
+        if !self.side_usable(src) || !self.side_usable(dest) {
+            self.toast(ctx, "Both sides must be connected to transfer", true);
+            return;
+        }
+        let dest_remote = self.side_is_remote(dest);
+        if req.payload.remote && dest_remote {
+            self.start_staged(ctx, req, on_conflict);
+            return;
+        }
+        let verb = transfer_verb(req.payload.remote, dest_remote);
+        // A remote source is read by its own worker; otherwise the destination's writes.
+        let worker = if req.payload.remote { src } else { dest };
+        let spec = self.transfer_spec(&req, worker, verb);
+        let id = self.push_transfer(ctx, spec);
+        let cmd = transfer_command(id, &req, verb, on_conflict);
+        self.side_send(worker, cmd);
+    }
+
+    /// Row description for `req`, run by `worker` (the destination side counts
+    /// as an upload); the row keeps `req` so it can be replayed as issued.
     pub(super) fn transfer_spec(
         &self,
-        payload: &DragPayload,
-        dest: Side,
+        req: &RetryRequest,
         worker: Side,
         verb: Verb,
     ) -> NewTransfer {
         NewTransfer {
             worker,
-            label: transfer_label(&payload.paths),
-            dest: self.side_dest_label(dest, &self.side_pane(dest).cwd),
-            upload: worker == dest,
+            label: transfer_label(&req.payload.paths),
+            dest: self.side_dest_label(req.dest, &req.dest_dir),
+            upload: worker == req.dest,
             verb,
-            retry: Some(RetryRequest {
-                payload: payload.clone(),
-                dest,
-                hosts: self.session_hosts(),
-            }),
+            retry: Some(req.clone()),
         }
     }
 
     /// The host connected on each side (left, right); `None` for a local pane.
     fn session_hosts(&self) -> [Option<Uuid>; 2] {
         [self.side_host(Side::Left), self.side_host(Side::Right)]
-    }
-
-    /// remote → local: the source worker downloads into the destination pane's directory.
-    fn start_download(
-        &mut self,
-        ctx: &egui::Context,
-        payload: DragPayload,
-        dest: Side,
-        on_conflict: OnConflict,
-    ) {
-        let local_dir = PathBuf::from(&self.side_pane(dest).cwd);
-        let spec = self.transfer_spec(&payload, dest, payload.side, Verb::Download);
-        let id = self.push_transfer(ctx, spec);
-        let cmd = Command::Download {
-            id,
-            remote: payload.paths,
-            local_dir,
-            on_conflict,
-        };
-        self.side_send(payload.side, cmd);
-    }
-
-    /// local → remote: the destination worker uploads into its pane's directory.
-    fn start_upload(
-        &mut self,
-        ctx: &egui::Context,
-        payload: DragPayload,
-        dest: Side,
-        on_conflict: OnConflict,
-    ) {
-        let remote_dir = self.side_pane(dest).cwd.clone();
-        let spec = self.transfer_spec(&payload, dest, dest, Verb::Upload);
-        let id = self.push_transfer(ctx, spec);
-        let local = payload.paths.iter().map(PathBuf::from).collect();
-        self.side_send(
-            dest,
-            Command::Upload {
-                id,
-                local,
-                remote_dir,
-                on_conflict,
-            },
-        );
     }
 
     // -- finishing --------------------------------------------------------

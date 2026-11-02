@@ -420,8 +420,16 @@ impl eframe::App for FerropipeApp {
 }
 
 impl FerropipeApp {
-    /// Hosts sidebar on the left; the two file panes fill the rest.
+    /// Hosts sidebar on the left; the two file panes fill the rest. The whole
+    /// workspace is disabled (still painted, greyed) while a modal is open, so
+    /// nothing a prompt is about — a pane's directory, its host — can change
+    /// under it. The modals themselves are drawn afterwards by `render_dialogs`.
     fn render_workspace(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let enabled = !self.modal_open();
+        ui.add_enabled_ui(enabled, |ui| self.render_workspace_body(ctx, ui));
+    }
+
+    fn render_workspace_body(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         egui::Panel::left("connections")
             .resizable(true)
             .default_size(crate::theme::SIDEBAR_W)

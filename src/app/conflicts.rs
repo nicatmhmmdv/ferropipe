@@ -255,4 +255,37 @@ mod tests {
     fn conflict_lines_is_empty_without_conflicts() {
         assert!(conflict_lines(&[]).is_empty());
     }
+
+    // -- PolicyTarget::Fresh ------------------------------------------------
+
+    #[test]
+    fn fresh_target_replays_into_the_directory_pinned_when_it_was_issued() {
+        // Arrange: the transfer was issued while the pane showed /srv/www.
+        let req = RetryRequest {
+            payload: DragPayload {
+                side: Side::Left,
+                remote: false,
+                paths: vec!["/home/u/a.txt".into()],
+            },
+            dest: Side::Right,
+            dest_dir: "/srv/www".into(),
+            hosts: [None, Some(Uuid::new_v4())],
+        };
+        let prompt = ConflictPrompt {
+            target: PolicyTarget::Fresh(req),
+            conflicts: vec![conflict("a.txt", 1, 2)],
+        };
+        // Act: an answer re-issues what the target carries, with its policy.
+        let PolicyTarget::Fresh(req) = prompt.target else {
+            panic!("a fresh request");
+        };
+        let cmd =
+            transfers::transfer_command(1, &req, transfers::Verb::Upload, OnConflict::Overwrite);
+        // Assert: the pinned directory, not wherever the pane is now.
+        assert!(matches!(
+            cmd,
+            Command::Upload { remote_dir, on_conflict: OnConflict::Overwrite, .. }
+                if remote_dir == "/srv/www"
+        ));
+    }
 }

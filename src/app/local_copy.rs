@@ -1,34 +1,12 @@
 //! Local → local copies: when both panes show this computer, the destination
 //! pane's (idle) worker copies the files off the UI thread and reports
-//! progress like an upload.
+//! progress like an upload. The command is issued with every other transfer
+//! (`transfers::transfer_command`); what lands here is the relisting once it
+//! has finished.
 
 use super::*;
-use transfers::Verb;
 
 impl FerropipeApp {
-    /// local → local: the destination side's worker copies into its pane's directory.
-    pub(super) fn start_local_copy(
-        &mut self,
-        ctx: &egui::Context,
-        payload: DragPayload,
-        dest: Side,
-        on_conflict: OnConflict,
-    ) {
-        let dest_dir = PathBuf::from(&self.side_pane(dest).cwd);
-        let spec = self.transfer_spec(&payload, dest, dest, Verb::Copy);
-        let id = self.push_transfer(ctx, spec);
-        let paths = payload.paths.iter().map(PathBuf::from).collect();
-        self.side_send(
-            dest,
-            Command::CopyLocal {
-                id,
-                paths,
-                dest_dir,
-                on_conflict,
-            },
-        );
-    }
-
     /// A transfer into `dest` succeeded: relist it when it is local, and the
     /// other pane too when that is local and shows the same directory.
     pub(super) fn relist_local_dest(&mut self, dest: Side) {

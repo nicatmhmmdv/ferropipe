@@ -10,6 +10,7 @@ use super::{
     Event, MAX_DEPTH, RemoteFs, TransferProgress, basename, copy_with_progress, file_name_of,
     safe_component,
 };
+use crate::diag::Level;
 use anyhow::{Context, Result, anyhow};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -146,7 +147,7 @@ pub(super) fn download(
         return Ok(Outcome::NeedsAnswer);
     }
     for d in &plan.dirs {
-        std::fs::create_dir_all(d).ok();
+        ensure_local_dir(d);
     }
     let mut progress = Reporter::new(id, plan.files.len(), plan.bytes_total(), emit);
     for (idx, (src, dst, size)) in plan.files.iter().enumerate() {
@@ -160,7 +161,8 @@ pub(super) fn download(
     Ok(Outcome::Done)
 }
 
-/// Fetch one remote file into place through a `.ferropipe-part` sibling.
+/// Fetch one remote file into place through a `.ferropipe-part` sibling,
+/// which is removed again when the copy fails.
 fn download_file(
     fs: &dyn RemoteFs,
     src: &str,
@@ -169,19 +171,47 @@ fn download_file(
     progress: &mut Reporter,
 ) -> Result<()> {
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).ok();
+        ensure_local_dir(parent);
     }
     let fname = file_name_of(dst);
-    let tmp = dst.with_extension("ferropipe-part");
-    {
-        let mut out = std::fs::File::create(&tmp)?;
-        fs.read_file(src, &mut out, &mut |delta| {
-            progress.advance(delta, file_index, &fname);
-        })?;
-        out.flush()?;
+    let tmp = part_path(dst);
+    let written: Result<()> = (|| {
+        {
+            let mut out = std::fs::File::create(&tmp)?;
+            fs.read_file(src, &mut out, &mut |delta| {
+                progress.advance(delta, file_index, &fname);
+            })?;
+            out.flush()?;
+        }
+        std::fs::rename(&tmp, dst)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, dst)?;
-    Ok(())
+    written
+}
+
+/// Create the local `dir` (and its parents). A failure is logged, not fatal:
+/// the files still copy, and each one that can't says why itself.
+fn ensure_local_dir(dir: &Path) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        let msg = format!("mkdir {}: {e}", dir.display());
+        crate::diag::log(Level::Warn, "transfer", msg);
+    }
+}
+
+/// Create the remote `dir`. A failure is logged unless the directory is
+/// already there (a copy merging into an existing tree), and is not fatal:
+/// the files still copy, and each one that can't says why itself.
+fn ensure_remote_dir(fs: &dyn RemoteFs, dir: &str) {
+    let Err(e) = fs.mkdir(dir) else {
+        return;
+    };
+    if fs.stat(dir).is_ok_and(|st| st.is_dir) {
+        return;
+    }
+    crate::diag::log(Level::Warn, "transfer", format!("mkdir {dir}: {e:#}"));
 }
 
 fn walk_remote(
@@ -258,7 +288,7 @@ pub(super) fn upload(
         return Ok(Outcome::NeedsAnswer);
     }
     for d in &plan.dirs {
-        let _ = fs.mkdir(d);
+        ensure_remote_dir(fs, d);
     }
     let mut progress = Reporter::new(id, plan.files.len(), plan.bytes_total(), emit);
     for (idx, (src, dst, size)) in plan.files.iter().enumerate() {
